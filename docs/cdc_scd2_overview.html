@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CDC &amp; SCD2 Data Flow — Source to Bronze</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0a0e17;
+  --surface: #111827;
+  --surface-alt: #151f2e;
+  --border: #1e2d3d;
+  --text: #e2e8f0;
+  --text-dim: #8896aa;
+  --text-muted: #4a5568;
+  --oracle: #ef5350;
+  --sqlserver: #42a5f5;
+  --polars: #ffb74d;
+  --bcp: #66bb6a;
+  --cdc: #42a5f5;
+  --scd2: #ef5350;
+  --stage: #ab47bc;
+  --bronze: #ff9800;
+  --hash: #26c6da;
+  --guard: #fdd835;
+  --arrow: #3d6b99;
+  --glow-blue: rgba(66,165,245,0.12);
+  --glow-orange: rgba(255,152,0,0.12);
+  --glow-red: rgba(239,83,80,0.10);
+}
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.bg-grid {
+  position: fixed; inset: 0;
+  background-image:
+    linear-gradient(rgba(30,45,61,0.25) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(30,45,61,0.25) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none; z-index: 0;
+}
+.container {
+  position: relative; z-index: 1;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 40px 28px 80px;
+}
+
+/* ── Header ── */
+header { text-align: center; margin-bottom: 52px; }
+header h1 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 26px; font-weight: 700;
+  background: linear-gradient(135deg, #e2e8f0 0%, #8896aa 100%);
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  margin-bottom: 6px;
+}
+header p { color: var(--text-dim); font-size: 14px; }
+
+/* ── Phases ── */
+.phase {
+  position: relative;
+  margin-bottom: 0;
+}
+.phase-header {
+  display: flex; align-items: center; gap: 12px;
+  margin-bottom: 16px;
+}
+.phase-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; font-weight: 700;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  color: var(--text-dim);
+  letter-spacing: 1px;
+}
+.phase-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px; font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.2px;
+}
+
+/* ── Nodes ── */
+.nodes {
+  display: flex; gap: 16px;
+  flex-wrap: wrap;
+}
+.node {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 20px;
+  flex: 1;
+  min-width: 200px;
+  transition: border-color 0.3s, box-shadow 0.3s;
+  overflow: hidden;
+}
+.node:hover {
+  border-color: var(--arrow);
+  box-shadow: 0 0 20px var(--glow-blue);
+}
+.node-accent {
+  position: absolute; top: 0; left: 0; right: 0; height: 3px; border-radius: 10px 10px 0 0;
+}
+.accent-oracle  { background: var(--oracle); }
+.accent-sql     { background: var(--sqlserver); }
+.accent-polars  { background: var(--polars); }
+.accent-hash    { background: var(--hash); }
+.accent-cdc     { background: var(--cdc); }
+.accent-bcp     { background: var(--bcp); }
+.accent-stage   { background: var(--stage); }
+.accent-scd2    { background: var(--scd2); }
+.accent-bronze  { background: var(--bronze); }
+.accent-guard   { background: var(--guard); }
+.node-icon {
+  display: inline-block;
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+.node-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px; font-weight: 600;
+  margin-bottom: 6px;
+  color: #fff;
+}
+.node-desc {
+  font-size: 12px; line-height: 1.55;
+  color: var(--text-dim);
+}
+.node-desc code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: var(--polars);
+}
+.node-tag {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; font-weight: 600;
+  padding: 2px 8px; border-radius: 4px;
+  margin-top: 10px;
+  letter-spacing: 0.5px;
+}
+.tag-oracle  { background: rgba(239,83,80,0.15); color: var(--oracle); }
+.tag-sql     { background: rgba(66,165,245,0.15); color: var(--sqlserver); }
+.tag-polars  { background: rgba(255,183,77,0.15); color: var(--polars); }
+.tag-hash    { background: rgba(38,198,218,0.15); color: var(--hash); }
+.tag-cdc     { background: rgba(66,165,245,0.15); color: var(--cdc); }
+.tag-bcp     { background: rgba(102,187,106,0.15); color: var(--bcp); }
+.tag-stage   { background: rgba(171,71,188,0.15); color: var(--stage); }
+.tag-scd2    { background: rgba(239,83,80,0.15); color: var(--scd2); }
+.tag-bronze  { background: rgba(255,152,0,0.15); color: var(--bronze); }
+.tag-guard   { background: rgba(253,216,53,0.15); color: var(--guard); }
+
+.node-wide { min-width: 100%; }
+
+/* ── Arrows ── */
+.arrow {
+  display: flex; align-items: center; justify-content: center;
+  padding: 14px 0;
+  position: relative;
+}
+.arrow-line {
+  display: flex; flex-direction: column; align-items: center; gap: 0;
+}
+.arrow-shaft {
+  width: 2px; height: 28px;
+  background: linear-gradient(180deg, var(--arrow) 0%, rgba(61,107,153,0.3) 100%);
+}
+.arrow-head {
+  width: 0; height: 0;
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-top: 8px solid var(--arrow);
+}
+.arrow-label {
+  position: absolute;
+  left: 50%; transform: translateX(-50%);
+  top: 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; color: var(--text-muted);
+  white-space: nowrap;
+  letter-spacing: 0.3px;
+}
+.arrow-label-right {
+  left: auto; right: 60px; transform: none;
+}
+
+/* ── Divider ── */
+.layer-divider {
+  display: flex; align-items: center; gap: 12px;
+  margin: 24px 0 20px;
+}
+.layer-divider::before, .layer-divider::after {
+  content: ''; flex: 1; height: 1px;
+}
+.layer-divider::before {
+  background: linear-gradient(90deg, transparent, var(--border));
+}
+.layer-divider::after {
+  background: linear-gradient(90deg, var(--border), transparent);
+}
+.layer-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  padding: 4px 14px;
+  border-radius: 6px;
+}
+.label-stage { color: var(--stage); background: rgba(171,71,188,0.1); border: 1px solid rgba(171,71,188,0.2); }
+.label-bronze { color: var(--bronze); background: rgba(255,152,0,0.1); border: 1px solid rgba(255,152,0,0.2); }
+.label-extract { color: var(--polars); background: rgba(255,183,77,0.1); border: 1px solid rgba(255,183,77,0.2); }
+
+/* ── CDC Detail Box ── */
+.detail-box {
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px 22px;
+  margin-top: 14px;
+}
+.detail-box h4 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; font-weight: 600;
+  margin-bottom: 10px;
+  color: var(--text);
+}
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.detail-item {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.05);
+  border-radius: 7px;
+  padding: 12px 14px;
+}
+.detail-item .label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  margin-bottom: 4px;
+}
+.detail-item .desc {
+  font-size: 11.5px; line-height: 1.5;
+  color: var(--text-dim);
+}
+.label-insert { color: #66bb6a; }
+.label-update { color: #ffb74d; }
+.label-delete { color: #ef5350; }
+.label-unchanged { color: #78909c; }
+
+/* ── Crash Safety Callout ── */
+.callout {
+  background: rgba(255,152,0,0.06);
+  border: 1px solid rgba(255,152,0,0.2);
+  border-left: 3px solid var(--bronze);
+  border-radius: 0 8px 8px 0;
+  padding: 14px 18px;
+  margin-top: 14px;
+}
+.callout-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; font-weight: 700;
+  color: var(--bronze);
+  margin-bottom: 4px;
+  letter-spacing: 0.3px;
+}
+.callout-text {
+  font-size: 12px; line-height: 1.55;
+  color: var(--text-dim);
+}
+
+.callout-red {
+  background: rgba(239,83,80,0.06);
+  border-color: rgba(239,83,80,0.2);
+  border-left-color: var(--scd2);
+}
+.callout-red .callout-title { color: var(--scd2); }
+
+.callout-blue {
+  background: rgba(66,165,245,0.06);
+  border-color: rgba(66,165,245,0.2);
+  border-left-color: var(--cdc);
+}
+.callout-blue .callout-title { color: var(--cdc); }
+
+/* ── SCD2 Steps ── */
+.scd2-steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-top: 14px;
+}
+.scd2-step {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 8px;
+  padding: 14px 16px;
+  position: relative;
+}
+.scd2-step::before {
+  content: attr(data-step);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px; font-weight: 700;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+.scd2-step .step-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px; font-weight: 600;
+  margin: 6px 0 4px;
+  color: #fff;
+}
+.scd2-step .step-desc {
+  font-size: 11.5px; line-height: 1.5;
+  color: var(--text-dim);
+}
+
+/* ── Column Tags ── */
+.col-tags {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 10px;
+}
+.col-tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  color: var(--text-dim);
+}
+
+/* ── Footer ── */
+.footer {
+  text-align: center;
+  margin-top: 48px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ── Animations ── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.phase { animation: fadeUp 0.5s ease-out both; }
+.phase:nth-child(2)  { animation-delay: 0.05s; }
+.phase:nth-child(3)  { animation-delay: 0.10s; }
+.phase:nth-child(4)  { animation-delay: 0.15s; }
+.phase:nth-child(5)  { animation-delay: 0.20s; }
+.phase:nth-child(6)  { animation-delay: 0.25s; }
+.phase:nth-child(7)  { animation-delay: 0.30s; }
+.phase:nth-child(8)  { animation-delay: 0.35s; }
+.phase:nth-child(9)  { animation-delay: 0.40s; }
+.phase:nth-child(10) { animation-delay: 0.45s; }
+.phase:nth-child(11) { animation-delay: 0.50s; }
+.phase:nth-child(12) { animation-delay: 0.55s; }
+.phase:nth-child(13) { animation-delay: 0.60s; }
+.phase:nth-child(14) { animation-delay: 0.65s; }
+.phase:nth-child(15) { animation-delay: 0.70s; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.6; }
+  50%      { opacity: 1; }
+}
+.live-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  margin-right: 6px;
+  animation: pulse 2s ease-in-out infinite;
+}
+.dot-cdc  { background: var(--cdc); }
+.dot-scd2 { background: var(--scd2); }
+.dot-bcp  { background: var(--bcp); }
+</style>
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="container">
+
+<header>
+  <h1>CDC &amp; SCD2 — Data Flow Wire</h1>
+  <p>Source Systems → Extraction → Hash → CDC → Stage → SCD2 → Bronze</p>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- PHASE 1: SOURCE EXTRACTION -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-num">01</span>
+    <span class="phase-title">Source Extraction</span>
+  </div>
+  <div class="nodes">
+    <div class="node">
+      <div class="node-accent accent-oracle"></div>
+      <div class="node-icon">🗄️</div>
+      <div class="node-title">Oracle (DNA)</div>
+      <div class="node-desc">ConnectorX Rust-native extraction via <code>oracle://</code>. Falls back to <code>oracledb</code> thick mode for date-chunked extraction with INDEX hints.</div>
+      <span class="node-tag tag-oracle">ORACLE</span>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-sql"></div>
+      <div class="node-icon">🗄️</div>
+      <div class="node-title">SQL Server (CCM / EPICOR)</div>
+      <div class="node-desc">ConnectorX bulk extraction via <code>mssql://</code>. Full table scan — 10-20x faster than row-by-row.</div>
+      <span class="node-tag tag-sql">SQL SERVER</span>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-polars"></div>
+      <div class="node-icon">📊</div>
+      <div class="node-title">Polars DataFrame</div>
+      <div class="node-desc">Extraction lands in a Polars DataFrame in memory. Column names, types, and order are validated against <code>UdmTablesColumnsList</code>.</div>
+      <span class="node-tag tag-polars">POLARS</span>
+    </div>
+  </div>
+</div>
+
+<!-- ARROW -->
+<div class="arrow">
+  <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+  <span class="arrow-label">Raw DataFrame → Sanitization + Hashing</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- PHASE 2: SANITIZATION & HASHING -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-num">02</span>
+    <span class="phase-title">Sanitize &amp; Hash</span>
+  </div>
+  <div class="nodes">
+    <div class="node">
+      <div class="node-accent accent-polars"></div>
+      <div class="node-icon">🧹</div>
+      <div class="node-title">Sanitization</div>
+      <div class="node-desc">Strings cleaned (tabs/newlines), BIT columns cast to Int8, UInt64 reinterpreted, Oracle DATE columns fixed. Columns reordered to match target <code>INFORMATION_SCHEMA</code> ordinal position (P0-1).</div>
+      <span class="node-tag tag-polars">SANITIZE</span>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-hash"></div>
+      <div class="node-icon">🔐</div>
+      <div class="node-title">SHA-256 Row Hash</div>
+      <div class="node-desc">
+        <code>polars-hash</code> (Rust-native) computes a full 64-char hex SHA-256 per row. Normalization applied first: NFC, RTRIM, float rounding, Oracle empty→NULL, NaN/Inf sentinels, <code>\x1F</code> column separator.
+      </div>
+      <span class="node-tag tag-hash">_row_hash</span>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-guard"></div>
+      <div class="node-icon">🛡️</div>
+      <div class="node-title">Pre-CDC Guards</div>
+      <div class="node-desc">
+        <strong>NULL PK Filter</strong> (P0-4): removes rows with NULL PKs. <strong>Extraction Guard</strong> (P1-1): blocks CDC if rows drop &gt;90%. <strong>Schema Validation</strong> (E-11): checks columns against expected.
+      </div>
+      <span class="node-tag tag-guard">SAFEGUARDS</span>
+    </div>
+  </div>
+</div>
+
+<!-- DIVIDER -->
+<div class="layer-divider">
+  <span class="layer-label label-stage">UDM_STAGE — Change Data Capture</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- PHASE 3: CDC ENGINE -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-num">03</span>
+    <span class="phase-title"><span class="live-dot dot-cdc"></span>CDC Engine — Polars In-Memory Comparison</span>
+  </div>
+  <div class="nodes">
+    <div class="node node-wide">
+      <div class="node-accent accent-cdc"></div>
+      <div class="node-icon">🔍</div>
+      <div class="node-title">Hash-Based Change Detection</div>
+      <div class="node-desc">
+        Compares fresh extraction (<code>df_fresh</code>) against existing Stage current rows (<code>df_existing</code>) using Polars joins on primary key columns. PK dtype alignment (P0-12) runs first to prevent silent join failures. Count invariant validated: <code>inserts + updates + unchanged == total_fresh</code>.
+      </div>
+    </div>
+  </div>
+
+  <!-- CDC detail breakdown -->
+  <div class="detail-box">
+    <h4>Classification via Polars Joins</h4>
+    <div class="detail-grid">
+      <div class="detail-item">
+        <div class="label label-insert">INSERT — Anti-Join</div>
+        <div class="desc">Rows in <code>df_fresh</code> but NOT in <code>df_existing</code>. PK has never been seen. New rows in the source system.</div>
+      </div>
+      <div class="detail-item">
+        <div class="label label-update">UPDATE — Inner Join + Hash ≠</div>
+        <div class="desc">PK exists in both, but <code>_row_hash</code> differs. Source data changed. NULL hash guard (P0-10) treats missing hashes as "changed".</div>
+      </div>
+      <div class="detail-item">
+        <div class="label label-delete">DELETE — Reverse Anti-Join</div>
+        <div class="desc">Rows in <code>df_existing</code> but NOT in <code>df_fresh</code>. Row removed from source. Windowed: scoped to extraction window only (P1-4).</div>
+      </div>
+      <div class="detail-item">
+        <div class="label label-unchanged">UNCHANGED — Inner Join + Hash =</div>
+        <div class="desc">PK exists in both and hashes match exactly. No change detected. Row is carried forward as-is.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="callout callout-blue">
+    <div class="callout-title">⚡ INSERT-First Crash Safety (P0-9)</div>
+    <div class="callout-text">New CDC rows are INSERTed before old rows are expired. A crash after INSERT but before EXPIRE leaves recoverable duplicate current rows — not zero current rows (data loss). The next run's dedup step (L-1) corrects automatically.</div>
+  </div>
+</div>
+
+<!-- ARROW -->
+<div class="arrow">
+  <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+  <span class="arrow-label"><span class="live-dot dot-bcp"></span>BCP bulk load CDC-annotated changes → Stage table</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- PHASE 4: BCP → STAGE -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-num">04</span>
+    <span class="phase-title">BCP Load → Stage Table</span>
+  </div>
+  <div class="nodes">
+    <div class="node">
+      <div class="node-accent accent-bcp"></div>
+      <div class="node-icon">📥</div>
+      <div class="node-title">BCP Bulk Insert</div>
+      <div class="node-desc">Changes written to headerless CSV, loaded via Microsoft BCP into <code>UDM_Stage.{Source}.{Table}_cdc</code>. Column mapping is positional — order enforced by <code>reorder_columns_for_bcp()</code>.</div>
+      <span class="node-tag tag-bcp">BCP</span>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-stage"></div>
+      <div class="node-icon">📋</div>
+      <div class="node-title">Stage Table — CDC State</div>
+      <div class="node-desc">Each row carries CDC metadata. Current rows have <code>_cdc_is_current=1</code>. Expired rows remain for history (purged after 30 days via L-2). Stage is the comparison baseline for the next run.</div>
+      <div class="col-tags">
+        <span class="col-tag">_cdc_operation</span>
+        <span class="col-tag">_cdc_valid_from</span>
+        <span class="col-tag">_cdc_valid_to</span>
+        <span class="col-tag">_cdc_is_current</span>
+        <span class="col-tag">_cdc_batch_id</span>
+        <span class="col-tag">_row_hash</span>
+      </div>
+      <span class="node-tag tag-stage">UDM_STAGE</span>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-cdc"></div>
+      <div class="node-icon">🔄</div>
+      <div class="node-title">Expire Old Versions</div>
+      <div class="node-desc">Updated/deleted PKs are loaded into an ephemeral staging table, then UPDATE JOIN sets <code>_cdc_is_current=0</code> and <code>_cdc_valid_to=NOW()</code> on old rows. Staging table dropped in <code>finally</code> block.</div>
+      <span class="node-tag tag-cdc">EXPIRE</span>
+    </div>
+  </div>
+</div>
+
+<!-- ARROW -->
+<div class="arrow">
+  <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+  <span class="arrow-label">CDC current rows (df_current) → SCD2 comparison vs Bronze active</span>
+</div>
+
+<!-- DIVIDER -->
+<div class="layer-divider">
+  <span class="layer-label label-bronze">UDM_BRONZE — Slowly Changing Dimension Type 2</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- PHASE 5: SCD2 ENGINE -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-num">05</span>
+    <span class="phase-title"><span class="live-dot dot-scd2"></span>SCD2 Engine — Bronze Version Management</span>
+  </div>
+  <div class="nodes">
+    <div class="node node-wide">
+      <div class="node-accent accent-scd2"></div>
+      <div class="node-icon">🏛️</div>
+      <div class="node-title">SCD2 Comparison — _row_hash vs UdmHash</div>
+      <div class="node-desc">
+        Compares CDC current rows against active Bronze rows (<code>UdmActiveFlag=1</code>). Anti-join detects new inserts. Inner join + hash comparison detects new versions vs unchanged. Resurrections (E-18) tracked when deleted PKs reappear. Count invariant: <code>inserts + new_versions + unchanged == CDC unique PKs</code>.
+      </div>
+    </div>
+  </div>
+
+  <!-- SCD2 3-step pattern -->
+  <div class="scd2-steps">
+    <div class="scd2-step" data-step="STEP 1">
+      <div class="step-title" style="color: #66bb6a;">INSERT New Versions</div>
+      <div class="step-desc">New rows inserted with <code>UdmActiveFlag=1</code>. Updates &amp; resurrections inserted with <code>UdmActiveFlag=0</code> (inactive — waiting for activation after old versions close).</div>
+    </div>
+    <div class="scd2-step" data-step="STEP 2">
+      <div class="step-title" style="color: #ef5350;">CLOSE Old Versions</div>
+      <div class="step-desc">Old active versions set to <code>UdmActiveFlag=0</code>, <code>UdmEndDateTime=NOW()</code>. Batched at 4,000 rows (B-2) to prevent lock escalation. Via staging table + UPDATE JOIN.</div>
+    </div>
+    <div class="scd2-step" data-step="STEP 3">
+      <div class="step-title" style="color: #42a5f5;">ACTIVATE New Versions</div>
+      <div class="step-desc">New versions from Step 1 promoted to <code>UdmActiveFlag=1</code> via <code>_activate_new_versions()</code>. After this, exactly one active version exists per PK.</div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="callout-title">🔒 P0-8 — INSERT-First Crash Safety</div>
+    <div class="callout-text">Same principle as CDC: INSERT first, then UPDATE. A crash after Step 1 leaves orphaned Flag=0 rows (cleaned up by <code>_cleanup_orphaned_inactive_rows()</code> on next run). A crash after reverse order would leave zero active rows — unrecoverable data loss.</div>
+  </div>
+
+  <div class="callout callout-red">
+    <div class="callout-title">⛔ Bronze is APPEND-ONLY</div>
+    <div class="callout-text">SCD2 only closes old versions and inserts new ones. Bronze tables must NEVER be truncated. Deleting from Bronze destroys the audit trail permanently. If rows need correction, insert a new version — never modify history.</div>
+  </div>
+</div>
+
+<!-- ARROW -->
+<div class="arrow">
+  <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+  <span class="arrow-label"><span class="live-dot dot-bcp"></span>BCP bulk insert → Bronze + UPDATE JOIN via staging table</span>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- PHASE 6: BRONZE TABLE -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-num">06</span>
+    <span class="phase-title">Bronze Table — Full Version History</span>
+  </div>
+  <div class="nodes">
+    <div class="node" style="flex: 2;">
+      <div class="node-accent accent-bronze"></div>
+      <div class="node-icon">💾</div>
+      <div class="node-title">UDM_Bronze.{Source}.{Table}_scd2_python</div>
+      <div class="node-desc">
+        Append-only historical table. Every version of every row is preserved. Active version: <code>UdmActiveFlag=1, UdmEndDateTime IS NULL</code>. Historical versions: <code>UdmActiveFlag=0, UdmEndDateTime = when superseded</code>. Enables point-in-time queries and full change audit trail.
+      </div>
+      <div class="col-tags">
+        <span class="col-tag">UdmHash</span>
+        <span class="col-tag">UdmEffectiveDateTime</span>
+        <span class="col-tag">UdmEndDateTime</span>
+        <span class="col-tag">UdmActiveFlag</span>
+        <span class="col-tag">UdmScd2Operation</span>
+        <span class="col-tag">_scd2_key (IDENTITY)</span>
+      </div>
+      <span class="node-tag tag-bronze">UDM_BRONZE</span>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-scd2"></div>
+      <div class="node-icon">🔎</div>
+      <div class="node-title">SCD2 Operations</div>
+      <div class="node-desc">
+        <strong style="color:#66bb6a">I</strong> = First-time insert&emsp;
+        <strong style="color:#ffb74d">U</strong> = Update (new version)<br>
+        <strong style="color:#ef5350">D</strong> = Delete (version closed)&emsp;
+        <strong style="color:#42a5f5">R</strong> = Resurrection
+      </div>
+      <span class="node-tag tag-scd2">OPERATIONS</span>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- POST-PROCESSING / RECONCILIATION -->
+<!-- ═══════════════════════════════════════════════════════════ -->
+<div class="layer-divider">
+  <span class="layer-label" style="color: var(--hash); background: rgba(38,198,218,0.1); border: 1px solid rgba(38,198,218,0.2);">POST-PIPELINE — Monitoring &amp; Reconciliation</span>
+</div>
+
+<div class="phase">
+  <div class="phase-header">
+    <span class="phase-num">07</span>
+    <span class="phase-title">Integrity &amp; Monitoring</span>
+  </div>
+  <div class="nodes">
+    <div class="node">
+      <div class="node-accent accent-hash"></div>
+      <div class="node-icon">📊</div>
+      <div class="node-title">Event Tracking</div>
+      <div class="node-desc">Every CDC &amp; SCD2 promotion logged to <code>PipelineEventLog</code> with row counts, durations, and JSON metadata. E-12 update ratio, E-14 active ratio, E-15 freshness checks run automatically.</div>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-guard"></div>
+      <div class="node-icon">🔁</div>
+      <div class="node-title">Weekly Reconciliation</div>
+      <div class="node-desc">Full column-by-column comparison (P3-4) — not hash-based. Catches hash collisions, normalization bugs, late-arriving data. Aggregate checks (E-17) run daily for high-value tables.</div>
+    </div>
+    <div class="node">
+      <div class="node-accent accent-scd2"></div>
+      <div class="node-icon">✅</div>
+      <div class="node-title">SCD2 Integrity (V-3)</div>
+      <div class="node-desc">Validates: no duplicate active rows per PK, no orphaned inactive rows, no timeline gaps, active-to-total ratio &gt;1%. Version velocity check (E-13) flags PKs with &gt;10 versions.</div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  UDM Pipeline — CDC &amp; SCD2 Architecture Wire &nbsp;|&nbsp; February 2026
+</div>
+
+</div><!-- /container -->
+</body>
+</html>
