@@ -56,9 +56,12 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import json
+
 import polars as pl
 
 import connections
+from connections import cursor_for, quote_identifier, quote_table
 from data_load import bcp_loader
 from data_load.bcp_csv import validate_schema_before_concat, write_bcp_csv
 from data_load.sanitize import cast_bit_columns, reorder_columns_for_bcp, sanitize_strings
@@ -215,14 +218,27 @@ def _run_cdc_core(
 
     # --- Detect changes ---
 
+    # P-6: Use lazy + streaming engine for anti-joins to reduce peak memory.
+    # Polars v1.32+ supports native streaming anti-joins (PR #21937).
+    # The streaming engine uses morsel-driven parallelism, avoiding
+    # materialization of the full join result in memory.
+
     # INSERTS: rows in fresh but not in existing (anti-join on PKs)
-    df_new = df_fresh.join(df_existing, on=pk_columns, how="anti")
+    df_new = (
+        df_fresh.lazy()
+        .join(df_existing.lazy(), on=pk_columns, how="anti")
+        .collect(engine="streaming")
+    )
     result.inserts = len(df_new)
 
     # DELETES: rows in existing but not in fresh (reverse anti-join)
     # P1-4 (windowed): Only detects deletes WITHIN the extraction window,
     # not rows outside the window. Rows older than the window are untouched.
-    df_deleted = df_existing.join(df_fresh, on=pk_columns, how="anti")
+    df_deleted = (
+        df_existing.lazy()
+        .join(df_fresh.lazy(), on=pk_columns, how="anti")
+        .collect(engine="streaming")
+    )
     result.deletes = len(df_deleted)
 
     # P0-11: Capture deleted PKs for targeted SCD2 Bronze close (windowed only).
@@ -268,6 +284,22 @@ def _run_cdc_core(
         "%s %s%s: inserts=%d, updates=%d, deletes=%d, unchanged=%d",
         ctx.log_label, table_config.source_object_name, ctx.log_window,
         result.inserts, result.updates, result.deletes, result.unchanged,
+    )
+    # O-2: Structured JSON for downstream alerting without regex parsing.
+    logger.info(
+        "O-2_CDC: %s",
+        json.dumps({
+            "signal": "cdc_result",
+            "source": table_config.source_name,
+            "table": table_config.source_object_name,
+            "mode": ctx.log_label.lower().replace(" ", "_"),
+            "inserts": result.inserts,
+            "updates": result.updates,
+            "deletes": result.deletes,
+            "unchanged": result.unchanged,
+            "null_pk_rows": result.null_pk_rows,
+            "total_fresh": len(df_fresh),
+        }),
     )
 
     # --- Apply changes ---
@@ -679,54 +711,46 @@ def _expire_cdc_rows(
     db = stage_table.split(".")[0]
     schema = stage_table.split(".")[1]
     staging_table = f"{db}.{schema}._staging_expire_{table_config.source_object_name}"
+    q_staging = quote_table(staging_table)
 
     # P0-3: Use actual PK column types from target table instead of NVARCHAR(MAX)
     pk_types = get_column_types(stage_table, pk_columns)
 
-    conn = connections.get_connection(db)
+    pk_col_defs = ", ".join(f"{quote_identifier(c)} {pk_types[c]}" for c in pk_columns)
+    with cursor_for(db) as cur:
+        cur.execute(f"IF OBJECT_ID(?, 'U') IS NOT NULL DROP TABLE {q_staging}", staging_table)
+        cur.execute(f"CREATE TABLE {q_staging} ({pk_col_defs})")
+
     try:
-        cursor = conn.cursor()
+        # Write PKs to CSV — keep native dtypes (don't cast to Utf8)
+        expired_pks_clean = sanitize_strings(expired_pks)
+        csv_path = write_bcp_csv(
+            expired_pks_clean,
+            Path(output_dir) / f"{table_config.source_name}_{table_config.source_object_name}_expire_pks.csv",
+        )
+        # E-3: Staging tables are ephemeral — atomic=False for performance.
+        bcp_loader.bcp_load(str(csv_path), staging_table, atomic=False)
 
-        pk_col_defs = ", ".join(f"[{c}] {pk_types[c]}" for c in pk_columns)
-        cursor.execute(f"""
-            IF OBJECT_ID('{staging_table}', 'U') IS NOT NULL DROP TABLE {staging_table};
-            CREATE TABLE {staging_table} ({pk_col_defs})
-        """)
-        cursor.close()
-    finally:
-        conn.close()
+        # P2-5: Index staging table for efficient JOIN against large Stage tables
+        bcp_loader.create_staging_index(staging_table, pk_columns, row_count=len(expired_pks))
 
-    # Write PKs to CSV — keep native dtypes (don't cast to Utf8)
-    expired_pks_clean = sanitize_strings(expired_pks)
-    csv_path = write_bcp_csv(
-        expired_pks_clean,
-        Path(output_dir) / f"{table_config.source_name}_{table_config.source_object_name}_expire_pks.csv",
-    )
-    # E-3: Staging tables are ephemeral — atomic=False for performance.
-    bcp_loader.bcp_load(str(csv_path), staging_table, atomic=False)
+        # UPDATE join to expire rows
+        join_condition = " AND ".join(
+            f"t.{quote_identifier(c)} = s.{quote_identifier(c)}" for c in pk_columns
+        )
+        q_stage = quote_table(stage_table)
 
-    # P2-5: Index staging table for efficient JOIN against large Stage tables
-    bcp_loader.create_staging_index(staging_table, pk_columns, row_count=len(expired_pks))
+        with cursor_for(db) as cur:
+            cur.execute(f"""
+                UPDATE t
+                SET t._cdc_is_current = 0, t._cdc_valid_to = ?
+                FROM {q_stage} t
+                INNER JOIN {q_staging} s ON {join_condition}
+                WHERE t._cdc_is_current = 1
+            """, valid_to)
 
-    # UPDATE join to expire rows
-    join_condition = " AND ".join(
-        f"t.[{c}] = s.[{c}]" for c in pk_columns
-    )
-
-    conn = connections.get_connection(db)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(f"""
-            UPDATE t
-            SET t._cdc_is_current = 0, t._cdc_valid_to = ?
-            FROM {stage_table} t
-            INNER JOIN {staging_table} s ON {join_condition}
-            WHERE t._cdc_is_current = 1
-        """, valid_to)
-
-        # P2-14: Verify actual vs expected UPDATE row count
-        actual_rows = cursor.rowcount
-        cursor.close()
+            # P2-14: Verify actual vs expected UPDATE row count
+            actual_rows = cur.rowcount
 
         if actual_rows != len(expired_pks):
             if actual_rows < len(expired_pks):
@@ -747,13 +771,10 @@ def _expire_cdc_rows(
                 )
         else:
             logger.info("Expired %d CDC rows in %s", actual_rows, stage_table)
-
-        # Cleanup staging table
-        cursor = conn.cursor()
-        cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
-        cursor.close()
     finally:
-        conn.close()
+        # Always drop staging table — prevents orphaned tables on exception
+        with cursor_for(db) as cur:
+            cur.execute(f"DROP TABLE IF EXISTS {q_staging}")
 
 
 # ---------------------------------------------------------------------------
@@ -791,29 +812,27 @@ def purge_expired_cdc_rows(
     """
     db = stage_table.split(".")[0]
     total_purged = 0
+    q_stage = quote_table(stage_table)
 
-    conn = connections.get_connection(db)
-    try:
-        while True:
-            cursor = conn.cursor()
-            cursor.execute(f"""
-                DELETE TOP ({batch_size}) FROM {stage_table}
+    # Item-15: Use cursor_for() per batch — each batch gets a fresh connection.
+    # Prevents a single dropped connection from failing the entire purge loop.
+    while True:
+        with cursor_for(db) as cur:
+            cur.execute(f"""
+                DELETE TOP (?) FROM {q_stage}
                 WHERE _cdc_is_current = 0
-                  AND _cdc_valid_to < DATEADD(day, -{retention_days}, GETUTCDATE())
-            """)
-            deleted = cursor.rowcount
-            cursor.close()
-            total_purged += deleted
+                  AND _cdc_valid_to < DATEADD(day, -?, GETUTCDATE())
+            """, batch_size, retention_days)
+            deleted = cur.rowcount
+        total_purged += deleted
 
-            if deleted < batch_size:
-                break  # No more rows to purge
+        if deleted < batch_size:
+            break  # No more rows to purge
 
-            logger.info(
-                "L-2: Purged %d expired CDC rows from %s (%d total so far)",
-                deleted, stage_table, total_purged,
-            )
-    finally:
-        conn.close()
+        logger.info(
+            "L-2: Purged %d expired CDC rows from %s (%d total so far)",
+            deleted, stage_table, total_purged,
+        )
 
     if total_purged > 0:
         logger.info(
@@ -824,17 +843,6 @@ def purge_expired_cdc_rows(
 
     return total_purged
 
-
-# ---------------------------------------------------------------------------
-# W-5 TODO — Polars streaming engine adoption:
-#   Polars v1.31.1+ (January 2025) shipped a redesigned streaming engine based
-#   on morsel-driven parallelism, delivering 3-7x faster performance and
-#   supporting anti-joins natively. The old collect(streaming=True) API is
-#   deprecated in favor of collect(engine="streaming"). Evaluate converting
-#   the highest-memory operations (large table CDC anti-joins, SCD2 comparison,
-#   full reconciliation) to LazyFrame workflows with collect(engine="streaming").
-#   Requires Polars upgrade — check version compatibility with polars-hash first.
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # P1-3/P1-4: Windowed CDC for large tables

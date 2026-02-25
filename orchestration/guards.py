@@ -13,11 +13,14 @@ Guards prevent CDC processing when extraction row counts are suspicious:
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date
 from typing import TYPE_CHECKING
 
+import config
 import connections
+from connections import cursor_for
 
 if TYPE_CHECKING:
     from orchestration.table_config import TableConfig
@@ -67,6 +70,13 @@ def check_extraction_guard(
                 "(absolute ceiling=%d). Use --force to override.",
                 source_name, table_name, ctx, fresh_count, first_run_ceiling,
             )
+            # O-2: Structured JSON for extraction guard signals.
+            logger.info("O-2_GUARD: %s", json.dumps({
+                "signal": "extraction_guard", "source": source_name,
+                "table": table_name, "guard_type": "ceiling",
+                "fresh_count": fresh_count, "ceiling": first_run_ceiling,
+                "blocked": True,
+            }))
             return False
         return True
 
@@ -74,28 +84,40 @@ def check_extraction_guard(
     if drop_threshold > 0:
         drop_limit = int(baseline_count * drop_threshold)
         if fresh_count < drop_limit:
+            drop_pct = (1 - fresh_count / baseline_count) * 100
             logger.error(
                 "EXTRACTION GUARD: %s.%s%s row count dropped from %d to %d "
                 "(threshold=%d, %.0f%% drop). Skipping to prevent false mass-delete. "
                 "Use --force to override.",
                 source_name, table_name, ctx,
-                baseline_count, fresh_count, drop_limit,
-                (1 - fresh_count / baseline_count) * 100,
+                baseline_count, fresh_count, drop_limit, drop_pct,
             )
+            logger.info("O-2_GUARD: %s", json.dumps({
+                "signal": "extraction_guard", "source": source_name,
+                "table": table_name, "guard_type": "drop",
+                "baseline_count": baseline_count, "fresh_count": fresh_count,
+                "drop_percent": round(drop_pct, 1), "blocked": True,
+            }))
             return False
 
     # Drop guard — warn
     if warn_threshold > 0:
         warn_limit = int(baseline_count * warn_threshold)
         if warn_limit > 0 and fresh_count < warn_limit:
+            drop_pct = (1 - fresh_count / baseline_count) * 100
             logger.warning(
                 "EXTRACTION WARN: %s.%s%s row count dropped from %d to %d "
                 "(warn threshold=%d, %.0f%% drop). Proceeding, but "
                 "investigate if this trend continues.",
                 source_name, table_name, ctx,
-                baseline_count, fresh_count, warn_limit,
-                (1 - fresh_count / baseline_count) * 100,
+                baseline_count, fresh_count, warn_limit, drop_pct,
             )
+            logger.info("O-2_GUARD: %s", json.dumps({
+                "signal": "extraction_guard", "source": source_name,
+                "table": table_name, "guard_type": "warn",
+                "baseline_count": baseline_count, "fresh_count": fresh_count,
+                "drop_percent": round(drop_pct, 1), "blocked": False,
+            }))
 
     # Growth guard — block
     growth_limit = int(baseline_count * growth_threshold)
@@ -109,6 +131,13 @@ def check_extraction_guard(
             baseline_count, fresh_count,
             int(growth_threshold), growth_limit,
         )
+        logger.info("O-2_GUARD: %s", json.dumps({
+            "signal": "extraction_guard", "source": source_name,
+            "table": table_name, "guard_type": "growth",
+            "baseline_count": baseline_count, "fresh_count": fresh_count,
+            "growth_factor": round(fresh_count / baseline_count, 1),
+            "blocked": True,
+        }))
         return False
 
     return True
@@ -218,7 +247,7 @@ def get_extract_baseline(
 
     B-9: Uses same-day-of-week extractions from the last 30 days to build a
     baseline that accounts for weekend/holiday volume patterns. Falls back to
-    the last 5 runs (any day) if insufficient same-day data exists.
+    the last 14 runs (any day) if insufficient same-day data exists.
 
     Args:
         table_name: Table name.
@@ -228,13 +257,13 @@ def get_extract_baseline(
     Returns:
         Median row count or None if no history.
     """
-    conn = connections.get_general_connection()
-    try:
-        cursor = conn.cursor()
+    with cursor_for(config.GENERAL_DB) as cur:
+        # P-8: Prevent indefinite hang if General database is under contention.
+        cur.execute("SET LOCK_TIMEOUT 5000")
 
         # B-9: Day-of-week baseline first (last 30 days, same weekday)
-        cursor.execute(
-            "SELECT TOP 5 RowsProcessed "
+        cur.execute(
+            "SELECT TOP 14 RowsProcessed "
             "FROM ops.PipelineEventLog "
             "WHERE TableName = ? AND SourceName = ? "
             "AND EventType = 'EXTRACT' AND Status = 'SUCCESS' "
@@ -244,12 +273,12 @@ def get_extract_baseline(
             "ORDER BY CompletedAt DESC",
             table_name, source_name, exclude_batch_id,
         )
-        rows = cursor.fetchall()
+        rows = cur.fetchall()
 
         # Fall back to any-day baseline
         if len(rows) < 2:
-            cursor.execute(
-                "SELECT TOP 5 RowsProcessed "
+            cur.execute(
+                "SELECT TOP 14 RowsProcessed "
                 "FROM ops.PipelineEventLog "
                 "WHERE TableName = ? AND SourceName = ? "
                 "AND EventType = 'EXTRACT' AND Status = 'SUCCESS' "
@@ -257,12 +286,9 @@ def get_extract_baseline(
                 "ORDER BY CompletedAt DESC",
                 table_name, source_name, exclude_batch_id,
             )
-            rows = cursor.fetchall()
+            rows = cur.fetchall()
 
-        cursor.close()
-        return _median_from_rows(rows)
-    finally:
-        conn.close()
+    return _median_from_rows(rows)
 
 
 def get_daily_extract_baseline(
@@ -284,13 +310,13 @@ def get_daily_extract_baseline(
     Returns:
         Median daily row count or None if no history.
     """
-    conn = connections.get_general_connection()
-    try:
-        cursor = conn.cursor()
+    with cursor_for(config.GENERAL_DB) as cur:
+        # P-8: Prevent indefinite hang if General database is under contention.
+        cur.execute("SET LOCK_TIMEOUT 5000")
 
         # B-9: Day-of-week baseline first (last 30 days, same weekday)
-        cursor.execute(
-            "SELECT TOP 5 RowsProcessed "
+        cur.execute(
+            "SELECT TOP 14 RowsProcessed "
             "FROM ops.PipelineEventLog "
             "WHERE TableName = ? AND SourceName = ? "
             "AND EventType = 'EXTRACT' AND Status = 'SUCCESS' "
@@ -299,24 +325,21 @@ def get_daily_extract_baseline(
             "ORDER BY CompletedAt DESC",
             table_name, source_name,
         )
-        rows = cursor.fetchall()
+        rows = cur.fetchall()
 
         # Fall back to any-day baseline
         if len(rows) < 2:
-            cursor.execute(
-                "SELECT TOP 5 RowsProcessed "
+            cur.execute(
+                "SELECT TOP 14 RowsProcessed "
                 "FROM ops.PipelineEventLog "
                 "WHERE TableName = ? AND SourceName = ? "
                 "AND EventType = 'EXTRACT' AND Status = 'SUCCESS' "
                 "ORDER BY CompletedAt DESC",
                 table_name, source_name,
             )
-            rows = cursor.fetchall()
+            rows = cur.fetchall()
 
-        cursor.close()
-        return _median_from_rows(rows)
-    finally:
-        conn.close()
+    return _median_from_rows(rows)
 
 
 def _median_from_rows(rows: list) -> int | None:

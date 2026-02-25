@@ -75,6 +75,9 @@ def main() -> None:
 
     logger = logging.getLogger(__name__)
 
+    # H-4: Validate CLI arguments against known values before querying
+    cli_common.validate_cli_filters(args.source, args.table)
+
     # Load table configs
     loader = TableConfigLoader()
     configs = loader.load_small_tables(
@@ -157,6 +160,12 @@ def main() -> None:
                     failed += 1
                     logger.exception("Worker exception for %s.%s",
                                      td.get("source_name"), td.get("source_object_name"))
+
+    # P-3: Log connection overhead before flushing.
+    cli_common.log_connection_overhead()
+
+    # Item-18: Close pooled connections at shutdown.
+    cli_common.shutdown_connections()
 
     # Flush logs
     sql_handler.flush()

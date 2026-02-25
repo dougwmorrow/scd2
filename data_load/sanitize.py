@@ -13,6 +13,18 @@ import polars as pl
 logger = logging.getLogger(__name__)
 
 
+# Item-25: Module-level constant — avoids re-creating the list on every
+# _looks_like_datetime_column() invocation (called once per string column per table).
+_DATETIME_FORMATS = [
+    "%Y-%m-%d %H:%M:%S",       # Standard: 2025-01-15 10:30:00
+    "%Y-%m-%dT%H:%M:%S",       # ISO-8601: 2025-01-15T10:30:00
+    "%Y-%m-%d %H:%M:%S%.f",    # With fractional seconds: 2025-01-15 10:30:00.123
+    "%Y-%m-%dT%H:%M:%S%.f",    # ISO-8601 with fractions: 2025-01-15T10:30:00.123
+    "%d-%b-%Y %H:%M:%S",       # Oracle NLS: 15-JAN-2025 10:30:00
+    "%d-%b-%y %H:%M:%S",       # Oracle NLS short year: 15-JAN-25 10:30:00
+]
+
+
 class ColumnOrderError(Exception):
     """Raised when DataFrame column count doesn't match target table."""
 
@@ -75,13 +87,24 @@ def cast_bit_columns(df: pl.DataFrame, bit_columns: list[str] | None = None) -> 
     )
 
 
-def fix_oracle_date_columns(df: pl.DataFrame) -> pl.DataFrame:
+def fix_oracle_date_columns(
+    df: pl.DataFrame,
+    stage_table: str | None = None,
+) -> pl.DataFrame:
     """Fix ConnectorX Oracle DATE columns returned as Utf8 -> cast to Datetime.
 
     B-13: Also upcasts any pl.Date columns to pl.Datetime to prevent silent time
     truncation. Oracle DATE always includes hours/minutes/seconds — mapping to
     SQL Server DATE (date-only) silently truncates time. The correct target type
     is DATETIME2(0).
+
+    Args:
+        df: DataFrame with Oracle source columns.
+        stage_table: Item-20 — Optional Stage table name (e.g. 'UDM_Stage.DNA.ACCT_cdc').
+            If provided and the table exists, INFORMATION_SCHEMA is checked to identify
+            columns already typed as VARCHAR/NVARCHAR/CHAR. These are excluded from
+            content-based datetime detection to prevent false positives on string ID
+            columns that happen to contain datetime-formatted values.
     """
     # B-13: Upcast pl.Date -> pl.Datetime to prevent time truncation.
     # Oracle DATE always includes time; ConnectorX may return pl.Date in some versions.
@@ -100,11 +123,48 @@ def fix_oracle_date_columns(df: pl.DataFrame) -> pl.DataFrame:
         except Exception:
             logger.debug("B-13: Could not upcast column %s to Datetime", col)
 
-    # Original: fix Utf8 DATE columns
+    # Original: fix Utf8 DATE columns by name heuristic
     date_cols = [
         col for col, dtype in zip(df.columns, df.dtypes)
         if (dtype == pl.Utf8 or dtype == pl.String) and "DATE" in col.upper()
     ]
+
+    # Item-20: If Stage table exists, identify columns explicitly typed as string
+    # in INFORMATION_SCHEMA. These are excluded from content-based datetime detection
+    # to prevent false positives on string ID columns (e.g. BATCH_ID with values
+    # like "2025-01-15T10:30:00"). On first run (table doesn't exist), all columns
+    # go through the heuristic as before.
+    _STRING_SQL_TYPES = {"varchar", "nvarchar", "char", "nchar", "text", "ntext"}
+    known_string_cols: set[str] = set()
+    if stage_table:
+        try:
+            from data_load.schema_utils import get_column_metadata
+            for meta in get_column_metadata(stage_table):
+                if meta.data_type.lower() in _STRING_SQL_TYPES:
+                    known_string_cols.add(meta.column_name)
+        except Exception:
+            pass  # Stage table may not exist on first run — fall back to heuristic
+
+    # O-1: Content-based detection for string columns that parse as datetimes
+    # but don't have "DATE" in their name (e.g., CREATED_AT, MODIFIED_TS).
+    string_cols_without_date = [
+        col for col, dtype in zip(df.columns, df.dtypes)
+        if (dtype == pl.Utf8 or dtype == pl.String)
+        and "DATE" not in col.upper()
+        and col not in date_cols
+    ]
+    for col in string_cols_without_date:
+        # Item-20: Skip content-based detection for columns explicitly typed as
+        # string in the Stage table — casting these would corrupt the data.
+        if col in known_string_cols:
+            continue
+        if _looks_like_datetime_column(df, col):
+            date_cols.append(col)
+            logger.info(
+                "O-1: Content-based detection identified %s as a datetime column "
+                "(name heuristic missed it — no 'DATE' in column name)",
+                col,
+            )
 
     if not date_cols and not pure_date_cols:
         return df
@@ -122,6 +182,43 @@ def fix_oracle_date_columns(df: pl.DataFrame) -> pl.DataFrame:
             logger.debug("Could not cast column %s to Datetime, leaving as-is", col)
 
     return df
+
+
+def _looks_like_datetime_column(df: pl.DataFrame, col: str, sample_size: int = 20) -> bool:
+    """O-1: Content-based datetime detection for string columns.
+
+    Samples up to sample_size non-null values and checks if they match
+    common datetime patterns. Returns True if >=90% of sampled values
+    parse as datetimes.
+
+    Item-10: Improved robustness over original implementation:
+      - Sample size raised from 10 to 20 to reduce false positive risk.
+      - Match threshold raised from 80% to 90%.
+      - Multiple datetime formats checked (space-separated, ISO-8601 T-separator,
+        date-only, Oracle NLS_DATE_FORMAT variants).
+    """
+    if len(df) == 0:
+        return False
+
+    # Get non-null sample
+    sample = df[col].drop_nulls().head(sample_size)
+    if len(sample) == 0:
+        return False
+
+    # Item-10: Try multiple datetime formats to cover Oracle NLS_DATE_FORMAT
+    # variants and ISO-8601. Order matters — most common first for efficiency.
+    # Item-25: _DATETIME_FORMATS is defined at module level to avoid per-call allocation.
+    for fmt in _DATETIME_FORMATS:
+        try:
+            parsed = sample.str.to_datetime(format=fmt, strict=False)
+            non_null_count = parsed.drop_nulls().len()
+            # Item-10: Raised from 80% to 90% to reduce false positives.
+            if non_null_count >= len(sample) * 0.9:
+                return True
+        except Exception:
+            continue
+
+    return False
 
 
 def reinterpret_uint64(df: pl.DataFrame) -> pl.DataFrame:
@@ -191,7 +288,12 @@ def reorder_columns_for_bcp(
     # Reorder to match target — only select columns that exist in target
     ordered_cols = [c for c in target_cols if c in df_cols]
 
-    if ordered_cols != list(df.select(ordered_cols).columns):
+    # Item-21: Compare against DataFrame's original column order (filtered to
+    # target columns) to detect whether reordering is actually needed.
+    # Previous code compared ordered_cols against df.select(ordered_cols).columns
+    # which always matched (select returns columns in the order given).
+    original_order = [c for c in df.columns if c in target_set]
+    if ordered_cols != original_order:
         logger.warning(
             "Reordering DataFrame columns to match %s positional order",
             full_table_name,

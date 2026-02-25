@@ -11,6 +11,7 @@ Runs after ensure_stage_table / ensure_bronze_table but before CDC.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 import connections
+from connections import quote_identifier, quote_table
 from data_load.schema_utils import ColumnMetadata, get_column_metadata
 from extract.udm_connectorx_extractor import table_exists
 from schema.table_creator import _polars_dtype_to_sql
@@ -275,6 +277,22 @@ def _evolve_table(
             rejection_reason=f"Schema type change: {type_mismatches}",
         )
         raise SchemaEvolutionError(msg)
+
+    # O-2: Structured JSON for schema evolution signals.
+    if added or removed or type_mismatches:
+        logger.info(
+            "O-2_SCHEMA: %s",
+            json.dumps({
+                "signal": "schema_evolution",
+                "source": table_config.source_name,
+                "table": table_config.source_object_name,
+                "layer": layer,
+                "columns_added": sorted(added),
+                "columns_removed": sorted(removed),
+                "type_mismatches": type_mismatches,
+                "hash_affecting_change": len(added) > 0,
+            }),
+        )
 
     return sorted(added), sorted(removed)
 
@@ -551,7 +569,7 @@ def _add_columns(
         cursor = conn.cursor()
         for col_name, dtype in columns.items():
             sql_type = _polars_dtype_to_sql(dtype)
-            alter_sql = f"ALTER TABLE {full_table_name} ADD [{col_name}] {sql_type} NULL"
+            alter_sql = f"ALTER TABLE {quote_table(full_table_name)} ADD {quote_identifier(col_name)} {sql_type} NULL"
             try:
                 cursor.execute(alter_sql)
                 logger.info("Added column [%s] %s to %s", col_name, sql_type, full_table_name)

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import config
 import connections
+from connections import cursor_for, quote_table
 from cdc.engine import run_cdc, run_cdc_windowed
 from data_load import bcp_loader
 from data_load.index_management import disable_indexes, rebuild_indexes
@@ -70,16 +71,12 @@ def log_active_ratio(table_config: TableConfig, scd2_event) -> None:
     try:
         bronze_table = table_config.bronze_full_table_name
         db = bronze_table.split(".")[0]
-        conn = connections.get_connection(db)
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"SELECT COUNT(*) FROM {bronze_table} WHERE UdmActiveFlag = 1"
+        q_bronze = quote_table(bronze_table)
+        with cursor_for(db) as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM {q_bronze} WHERE UdmActiveFlag = 1"
             )
-            active_count = cursor.fetchone()[0]
-            cursor.close()
-        finally:
-            conn.close()
+            active_count = cur.fetchone()[0]
 
         total_count = scd2_event.rows_after
         if total_count > 0:
@@ -121,17 +118,13 @@ def log_data_freshness(table_config: TableConfig) -> None:
             return
 
         db = bronze_table.split(".")[0]
-        conn = connections.get_connection(db)
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"SELECT MAX(UdmEffectiveDateTime) FROM {bronze_table} "
+        q_bronze = quote_table(bronze_table)
+        with cursor_for(db) as cur:
+            cur.execute(
+                f"SELECT MAX(UdmEffectiveDateTime) FROM {q_bronze} "
                 "WHERE UdmActiveFlag = 1"
             )
-            row = cursor.fetchone()
-            cursor.close()
-        finally:
-            conn.close()
+            row = cur.fetchone()
 
         if row and row[0] is not None:
             max_effective = row[0]

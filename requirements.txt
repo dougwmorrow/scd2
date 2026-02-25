@@ -1,4 +1,7 @@
-polars>=1.0.0
+# N-3: Minimum version for native str.normalize("NFC") support (PR #20483).
+# P-6: Native streaming engine anti-joins require v1.32+ (PR #21937).
+# Deploying with <1.32 silently falls back to the in-memory engine.
+polars>=1.32.0
 # H-2: Pin polars-hash to exact version. polars-hash hashes the string
 # representation of values. A Polars or polars-hash version upgrade that
 # changes how values render as strings will silently change hashes, causing

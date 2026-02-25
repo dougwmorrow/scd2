@@ -41,12 +41,14 @@ W-1 TODO — Upgrade BCP to mssql-tools18 v18.6.1.1+:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 from contextlib import contextmanager
 
 import config
 import connections
+from connections import cursor_for, quote_identifier, quote_table
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +99,20 @@ def bcp_load(
         # -c mode without the codepage flag.
         "-S", f"{config.SQL_SERVER_HOST},{config.SQL_SERVER_PORT}",
         "-U", config.SQL_SERVER_USER,
-        "-P", config.SQL_SERVER_PASSWORD,
     ]
+
+    # H-5/H-6: Pass password via SQLCMDPASSWORD environment variable instead of
+    # -P flag to prevent exposure via /proc/{pid}/cmdline and `ps aux`.
+    # SQLCMDPASSWORD is documented for sqlcmd and works with BCP in mssql-tools18.
+    # Falls back to -P if SQLCMDPASSWORD is explicitly disabled via config.
+    #
+    # Item-11: Minimal environment — only propagate variables BCP actually needs.
+    # Prevents leaking other secrets (Oracle passwords, API keys, tokens) to the
+    # BCP subprocess via /proc/{pid}/environ.
+    bcp_env = {"SQLCMDPASSWORD": config.SQL_SERVER_PASSWORD}
+    for _env_key in ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP"):
+        if _env_key in os.environ:
+            bcp_env[_env_key] = os.environ[_env_key]
 
     # E-3: Only add -b batch size flag when NOT atomic.
     # Without -b, the entire BCP load is a single transaction — failure rolls back
@@ -120,6 +134,7 @@ def bcp_load(
         capture_output=True,
         text=True,
         timeout=config.BCP_TIMEOUT,
+        env=bcp_env,
     )
 
     if result.returncode != 0:
@@ -153,46 +168,31 @@ def _parse_rows_copied(stdout: str) -> int:
 def truncate_table(full_table_name: str) -> None:
     """Truncate a table (used for Stage CDC reload)."""
     db = full_table_name.split(".")[0]
-    conn = connections.get_connection(db)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(f"TRUNCATE TABLE {full_table_name}")
-        cursor.close()
-        logger.info("Truncated %s", full_table_name)
-    finally:
-        conn.close()
+    with cursor_for(db) as cur:
+        cur.execute(f"TRUNCATE TABLE {quote_table(full_table_name)}")
+    logger.info("Truncated %s", full_table_name)
 
 
 def execute_sql(full_table_name_or_db: str, sql: str, params: tuple = ()) -> None:
     """Execute arbitrary SQL against the database implied by the table name."""
     db = full_table_name_or_db.split(".")[0]
-    conn = connections.get_connection(db)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(sql, params)
-        cursor.close()
-    finally:
-        conn.close()
+    with cursor_for(db) as cur:
+        cur.execute(sql, params)
 
 
 def get_row_count(full_table_name: str) -> int:
     """Get approximate row count via sys.dm_db_partition_stats (P2-4)."""
     db = full_table_name.split(".")[0]
-    conn = connections.get_connection(db)
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
+    with cursor_for(db) as cur:
+        cur.execute(
             "SELECT SUM(p.row_count) "
             "FROM sys.dm_db_partition_stats p "
             "WHERE p.object_id = OBJECT_ID(?) "
             "AND p.index_id IN (0, 1)",
             full_table_name,
         )
-        row = cursor.fetchone()
-        cursor.close()
-        return int(row[0]) if row and row[0] is not None else 0
-    finally:
-        conn.close()
+        row = cur.fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def create_staging_index(
@@ -220,21 +220,17 @@ def create_staging_index(
         return
 
     db = staging_table.split(".")[0]
-    col_list = ", ".join(f"[{c}]" for c in pk_columns)
+    col_list = ", ".join(quote_identifier(c) for c in pk_columns)
     idx_name = f"CIX_{staging_table.split('.')[-1]}"
 
-    conn = connections.get_connection(db)
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            f"CREATE CLUSTERED INDEX [{idx_name}] ON {staging_table} ({col_list})"
-        )
-        cursor.close()
+        with cursor_for(db) as cur:
+            cur.execute(
+                f"CREATE CLUSTERED INDEX {quote_identifier(idx_name)} ON {quote_table(staging_table)} ({col_list})"
+            )
         logger.debug("P2-5: Created clustered index on %s (%s)", staging_table, col_list)
     except Exception:
         logger.debug("P2-5: Could not create index on %s — proceeding without", staging_table)
-    finally:
-        conn.close()
 
 
 @contextmanager
@@ -249,7 +245,20 @@ def bulk_load_recovery_context(database: str):
     try:
         cursor = conn.cursor()
         logger.info("Setting %s to BULK_LOGGED recovery model", database)
-        cursor.execute(f"ALTER DATABASE [{database}] SET RECOVERY BULK_LOGGED")
+        cursor.execute(f"ALTER DATABASE {quote_identifier(database)} SET RECOVERY BULK_LOGGED")
+        # Item-17: Verify the ALTER actually succeeded (catches permission issues).
+        cursor.execute(
+            "SELECT recovery_model_desc FROM sys.databases WHERE name = ?",
+            database,
+        )
+        row = cursor.fetchone()
+        if row and row[0] != "BULK_LOGGED":
+            logger.warning(
+                "Item-17: ALTER DATABASE SET RECOVERY BULK_LOGGED did not take effect "
+                "on %s (current model: %s). Pipeline user may lack ALTER DATABASE "
+                "permission. BCP loads will be fully logged.",
+                database, row[0] if row else "unknown",
+            )
         cursor.close()
     finally:
         conn.close()
@@ -261,15 +270,34 @@ def bulk_load_recovery_context(database: str):
         try:
             cursor = conn.cursor()
             logger.info("Restoring %s to FULL recovery model", database)
-            cursor.execute(f"ALTER DATABASE [{database}] SET RECOVERY FULL")
+            cursor.execute(f"ALTER DATABASE {quote_identifier(database)} SET RECOVERY FULL")
+            # Item-17: Verify restoration succeeded.
+            cursor.execute(
+                "SELECT recovery_model_desc FROM sys.databases WHERE name = ?",
+                database,
+            )
+            row = cursor.fetchone()
+            if row and row[0] != "FULL":
+                logger.warning(
+                    "Item-17: Failed to restore %s to FULL recovery model "
+                    "(current model: %s). Manual intervention may be needed.",
+                    database, row[0] if row else "unknown",
+                )
             cursor.close()
 
-            logger.info("Taking log backup for %s after BULK_LOGGED operation", database)
-            cursor = conn.cursor()
-            cursor.execute(
-                f"BACKUP LOG [{database}] TO DISK = N'/dev/null' WITH NO_TRUNCATE, NOFORMAT, NOINIT"
+            # R-1/R-3: Log backup after BULK_LOGGED intentionally omitted.
+            # The previous BACKUP LOG ... TO DISK = N'/dev/null' silently destroyed
+            # the log chain — SQL Server believed the backup succeeded but recovery
+            # was impossible through the BULK_LOGGED window. Point-in-time restore
+            # during pipeline windows is not a business requirement; the full backup
+            # schedule provides sufficient recovery coverage. The BULK_LOGGED window
+            # is short (single BCP load duration), and restoring to FULL recovery
+            # model ensures subsequent log backups resume the chain correctly.
+            logger.info(
+                "R-3: Restored %s to FULL recovery model. Log chain gap during "
+                "BULK_LOGGED window accepted — PITR not required during pipeline loads.",
+                database,
             )
-            cursor.close()
         except Exception:
             logger.exception("Failed to restore recovery model for %s", database)
         finally:

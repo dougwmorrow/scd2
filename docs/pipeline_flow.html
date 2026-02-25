@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UDM Data Pipeline — Architecture Flow</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0e17;
+    --surface: #111827;
+    --surface-alt: #1a2332;
+    --border: #1e2d3d;
+    --border-active: #2d4a6f;
+    --text: #e2e8f0;
+    --text-dim: #7a8ba3;
+    --text-muted: #4a5568;
+    --oracle: #e74c3c;
+    --oracle-dim: #c0392b;
+    --sqlserver: #2980b9;
+    --sqlserver-dim: #1a5276;
+    --polars: #f39c12;
+    --polars-dim: #d68910;
+    --bcp: #27ae60;
+    --bcp-dim: #1e8449;
+    --stage: #8e44ad;
+    --stage-dim: #6c3483;
+    --bronze: #e67e22;
+    --bronze-dim: #ca6f1e;
+    --general: #1abc9c;
+    --general-dim: #148f77;
+    --cdc: #3498db;
+    --scd2: #e74c3c;
+    --arrow: #3d5a80;
+    --glow: rgba(52, 152, 219, 0.15);
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .bg-grid {
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(30,45,61,0.3) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(30,45,61,0.3) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 40px 32px 80px;
+  }
+
+  header {
+    text-align: center;
+    margin-bottom: 48px;
+  }
+
+  header h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    background: linear-gradient(135deg, #e2e8f0 0%, #7a8ba3 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    margin-bottom: 8px;
+  }
+
+  header p {
+    color: var(--text-dim);
+    font-size: 14px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .toggle-bar {
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    margin-bottom: 40px;
+  }
+
+  .toggle-btn {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 8px 20px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.25s ease;
+  }
+
+  .toggle-btn:hover { border-color: var(--border-active); color: var(--text); }
+  .toggle-btn.active {
+    background: var(--surface-alt);
+    border-color: var(--cdc);
+    color: var(--text);
+    box-shadow: 0 0 20px rgba(52, 152, 219, 0.15);
+  }
+
+  .flow-section { display: none; }
+  .flow-section.active { display: block; }
+
+  /* ── Pipeline Flow ── */
+  .pipeline {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    position: relative;
+  }
+
+  .stage-row {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    position: relative;
+  }
+
+  .stage-label {
+    width: 120px;
+    min-width: 120px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px 8px;
+    position: relative;
+  }
+
+  .stage-label span {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--text-muted);
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    transform: rotate(180deg);
+  }
+
+  .stage-content {
+    flex: 1;
+    padding: 20px 0;
+  }
+
+  .nodes {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .node {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    min-width: 180px;
+    max-width: 280px;
+    position: relative;
+    transition: all 0.3s ease;
+    cursor: default;
+  }
+
+  .node:hover {
+    border-color: var(--border-active);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+  }
+
+  .node-icon {
+    font-size: 18px;
+    margin-bottom: 8px;
+    display: block;
+  }
+
+  .node-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 4px;
+    color: var(--text);
+  }
+
+  .node-desc {
+    font-size: 11.5px;
+    color: var(--text-dim);
+    line-height: 1.55;
+  }
+
+  .node-tag {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 4px;
+    margin-top: 8px;
+    letter-spacing: 0.5px;
+  }
+
+  .tag-oracle { background: rgba(231,76,60,0.15); color: var(--oracle); border: 1px solid rgba(231,76,60,0.25); }
+  .tag-sqlserver { background: rgba(41,128,185,0.15); color: var(--sqlserver); border: 1px solid rgba(41,128,185,0.25); }
+  .tag-polars { background: rgba(243,156,18,0.15); color: var(--polars); border: 1px solid rgba(243,156,18,0.25); }
+  .tag-bcp { background: rgba(39,174,96,0.15); color: var(--bcp); border: 1px solid rgba(39,174,96,0.25); }
+  .tag-stage { background: rgba(142,68,173,0.15); color: var(--stage); border: 1px solid rgba(142,68,173,0.25); }
+  .tag-bronze { background: rgba(230,126,34,0.15); color: var(--bronze); border: 1px solid rgba(230,126,34,0.25); }
+  .tag-general { background: rgba(26,188,156,0.15); color: var(--general); border: 1px solid rgba(26,188,156,0.25); }
+  .tag-cdc { background: rgba(52,152,219,0.15); color: var(--cdc); border: 1px solid rgba(52,152,219,0.25); }
+  .tag-scd2 { background: rgba(231,76,60,0.15); color: var(--scd2); border: 1px solid rgba(231,76,60,0.25); }
+
+  /* ── Arrow Connector ── */
+  .arrow-row {
+    display: flex;
+    align-items: center;
+    gap: 0;
+  }
+
+  .arrow-spacer {
+    width: 120px;
+    min-width: 120px;
+  }
+
+  .arrow-track {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 6px 0;
+    position: relative;
+  }
+
+  .arrow-line {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+  }
+
+  .arrow-shaft {
+    width: 2px;
+    height: 28px;
+    background: linear-gradient(to bottom, var(--border), var(--arrow));
+  }
+
+  .arrow-head {
+    width: 0;
+    height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 8px solid var(--arrow);
+  }
+
+  .arrow-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    color: var(--text-muted);
+    margin-left: 12px;
+    white-space: nowrap;
+  }
+
+  /* ── Divider ── */
+  .layer-divider {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    margin: 8px 0;
+  }
+
+  .divider-spacer {
+    width: 120px;
+    min-width: 120px;
+  }
+
+  .divider-line {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--border-active), transparent);
+    position: relative;
+  }
+
+  .divider-label {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--bg);
+    padding: 2px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  /* ── Legend ── */
+  .legend {
+    margin-top: 48px;
+    padding: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .legend h3 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-bottom: 16px;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+  }
+
+  .legend-items {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 24px;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+  }
+
+  /* ── Metadata sidebar ── */
+  .metadata-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+    margin-top: 32px;
+  }
+
+  .meta-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+  }
+
+  .meta-card h4 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-dim);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+
+  .meta-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(30,45,61,0.5);
+    font-size: 12px;
+  }
+
+  .meta-item:last-child { border-bottom: none; }
+
+  .meta-key {
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    flex-shrink: 0;
+    margin-right: 12px;
+  }
+
+  .meta-val {
+    color: var(--text-dim);
+    text-align: right;
+    font-size: 11.5px;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 900px) {
+    .stage-label { width: 60px; min-width: 60px; }
+    .arrow-spacer, .divider-spacer { width: 60px; min-width: 60px; }
+    .node { min-width: 140px; }
+  }
+
+  /* ── Animations ── */
+  @keyframes fadeSlideIn {
+    from { opacity: 0; transform: translateY(16px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .stage-row, .arrow-row, .layer-divider {
+    animation: fadeSlideIn 0.5s ease both;
+  }
+
+  .stage-row:nth-child(1) { animation-delay: 0.05s; }
+  .stage-row:nth-child(2) { animation-delay: 0.1s; }
+  .stage-row:nth-child(3) { animation-delay: 0.15s; }
+  .stage-row:nth-child(4) { animation-delay: 0.2s; }
+  .stage-row:nth-child(5) { animation-delay: 0.25s; }
+  .stage-row:nth-child(6) { animation-delay: 0.3s; }
+  .arrow-row:nth-child(2) { animation-delay: 0.07s; }
+  .arrow-row:nth-child(4) { animation-delay: 0.12s; }
+  .arrow-row:nth-child(6) { animation-delay: 0.17s; }
+  .arrow-row:nth-child(8) { animation-delay: 0.22s; }
+
+  .node-accent {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    border-radius: 10px 10px 0 0;
+  }
+
+  .accent-oracle { background: linear-gradient(90deg, var(--oracle), var(--oracle-dim)); }
+  .accent-sqlserver { background: linear-gradient(90deg, var(--sqlserver), var(--sqlserver-dim)); }
+  .accent-polars { background: linear-gradient(90deg, var(--polars), var(--polars-dim)); }
+  .accent-bcp { background: linear-gradient(90deg, var(--bcp), var(--bcp-dim)); }
+  .accent-stage { background: linear-gradient(90deg, var(--stage), var(--stage-dim)); }
+  .accent-bronze { background: linear-gradient(90deg, var(--bronze), var(--bronze-dim)); }
+  .accent-general { background: linear-gradient(90deg, var(--general), var(--general-dim)); }
+
+  .wide-node { max-width: 340px; }
+
+  .callout {
+    background: rgba(52,152,219,0.06);
+    border: 1px solid rgba(52,152,219,0.15);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin-top: 12px;
+    font-size: 11.5px;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .callout code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    background: rgba(255,255,255,0.06);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: var(--text);
+  }
+</style>
+</head>
+<body>
+<div class="bg-grid"></div>
+<div class="container">
+
+  <header>
+    <h1>Oracle / SQL Server → SQL Server ETL Pipeline</h1>
+    <p>Python + Polars + BCP &nbsp;·&nbsp; Medallion Architecture &nbsp;·&nbsp; CDC + SCD2</p>
+  </header>
+
+  <div class="toggle-bar">
+    <button class="toggle-btn active" onclick="showFlow('small')">Small Tables (Full Extract)</button>
+    <button class="toggle-btn" onclick="showFlow('large')">Large Tables (Date-Chunked)</button>
+  </div>
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- SMALL TABLES FLOW                          -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div id="flow-small" class="flow-section active">
+    <div class="pipeline">
+
+      <!-- ROW 1: SOURCES -->
+      <div class="stage-row">
+        <div class="stage-label"><span>Sources</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node">
+              <div class="node-accent accent-oracle"></div>
+              <span class="node-icon">🔶</span>
+              <div class="node-title">Oracle (DNA)</div>
+              <div class="node-desc">oracledb thick mode or ConnectorX <code>oracle://</code> extraction</div>
+              <span class="node-tag tag-oracle">SOURCE</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-sqlserver"></div>
+              <span class="node-icon">🔷</span>
+              <div class="node-title">SQL Server (CCM, EPICOR)</div>
+              <div class="node-desc">ConnectorX <code>mssql://</code> extraction</div>
+              <span class="node-tag tag-sqlserver">SOURCE</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">📋</span>
+              <div class="node-title">General.dbo.UdmTablesList</div>
+              <div class="node-desc">Metadata-driven config: table names, PKs, source routing, extraction params</div>
+              <span class="node-tag tag-general">METADATA</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">router.py routes Oracle vs SQL Server × ConnectorX vs oracledb</span>
+        </div>
+      </div>
+
+      <!-- ROW 2: EXTRACTION -->
+      <div class="stage-row">
+        <div class="stage-label"><span>Extract</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node wide-node">
+              <div class="node-accent accent-polars"></div>
+              <span class="node-icon">⚡</span>
+              <div class="node-title">ConnectorX Full Extract</div>
+              <div class="node-desc">Full table scan → Polars DataFrame. Routes: Oracle (no index hint) or SQL Server.</div>
+              <span class="node-tag tag-polars">POLARS DataFrame</span>
+            </div>
+            <div class="node wide-node">
+              <div class="node-accent accent-polars"></div>
+              <span class="node-icon">⚡</span>
+              <div class="node-title">oracledb Fallback</div>
+              <div class="node-desc">Oracle with INDEX hint. Date-chunked extraction with <code>TRUNC()</code> boundaries.</div>
+              <span class="node-tag tag-polars">POLARS DataFrame</span>
+            </div>
+          </div>
+          <div class="callout">
+            <strong>Post-extraction enrichment:</strong> <code>add_row_hash()</code> appends SHA-256 via polars-hash (deterministic across sessions). <code>_extracted_at</code> timestamp added. String sanitization removes <code>\t \n \r \x00</code>.
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">write BCP CSV (tab-delimited, no quoting, batch_size=4096)</span>
+        </div>
+      </div>
+
+      <!-- DIVIDER -->
+      <div class="layer-divider">
+        <div class="divider-spacer"></div>
+        <div class="divider-line">
+          <span class="divider-label">Schema & Guard Checks</span>
+        </div>
+      </div>
+
+      <!-- ROW 3: GUARDS -->
+      <div class="stage-row">
+        <div class="stage-label"><span>Validate</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">🏗️</span>
+              <div class="node-title">Table Auto-Create</div>
+              <div class="node-desc">Ensure Stage + Bronze tables exist. Create from DataFrame dtypes if missing.</div>
+              <span class="node-tag tag-general">DDL</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">🔄</span>
+              <div class="node-title">Schema Evolution</div>
+              <div class="node-desc">Detect drift: ADD new cols, WARN removed, ERROR on type change. Never drops columns.</div>
+              <span class="node-tag tag-general">P0-2</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">🛡️</span>
+              <div class="node-title">Extraction Guard</div>
+              <div class="node-desc">Skip CDC if row count drops &gt;90% vs baseline. Prevents accidental mass deletes.</div>
+              <span class="node-tag tag-general">P1-1</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">🔒</span>
+              <div class="node-title">Table Lock</div>
+              <div class="node-desc"><code>sp_getapplock</code> prevents concurrent pipeline runs on the same table.</div>
+              <span class="node-tag tag-general">P1-2</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">Polars in-memory comparison: source extract vs existing Stage CDC table</span>
+        </div>
+      </div>
+
+      <!-- DIVIDER -->
+      <div class="layer-divider">
+        <div class="divider-spacer"></div>
+        <div class="divider-line">
+          <span class="divider-label">UDM_Stage — Change Data Capture</span>
+        </div>
+      </div>
+
+      <!-- ROW 4: CDC -->
+      <div class="stage-row">
+        <div class="stage-label"><span>CDC</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node wide-node">
+              <div class="node-accent accent-stage"></div>
+              <span class="node-icon">🔍</span>
+              <div class="node-title">CDC Engine (Polars)</div>
+              <div class="node-desc">
+                NULL PK filter → anti-join for <strong>INSERTs</strong>, hash compare for <strong>UPDATEs</strong>, reverse anti-join for <strong>DELETEs</strong>. Columns reordered to match target INFORMATION_SCHEMA.
+              </div>
+              <span class="node-tag tag-cdc">CDC</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-bcp"></div>
+              <span class="node-icon">📥</span>
+              <div class="node-title">BCP Load → Stage</div>
+              <div class="node-desc">Changes captured via BCP into <code>UDM_Stage.{Source}.{Table}_cdc</code>. Adds <code>_cdc_operation</code>, <code>_cdc_valid_from/to</code>, <code>_cdc_is_current</code>, <code>_cdc_batch_id</code>.</div>
+              <span class="node-tag tag-stage">UDM_STAGE</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">Polars comparison: CDC current rows vs Bronze active rows</span>
+        </div>
+      </div>
+
+      <!-- DIVIDER -->
+      <div class="layer-divider">
+        <div class="divider-spacer"></div>
+        <div class="divider-line">
+          <span class="divider-label">UDM_Bronze — Slowly Changing Dimension Type 2</span>
+        </div>
+      </div>
+
+      <!-- ROW 5: SCD2 -->
+      <div class="stage-row">
+        <div class="stage-label"><span>SCD2</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node wide-node">
+              <div class="node-accent accent-bronze"></div>
+              <span class="node-icon">🏛️</span>
+              <div class="node-title">SCD2 Engine (Polars)</div>
+              <div class="node-desc">
+                Compare CDC current vs Bronze active. <strong>UPDATEs</strong>: close old version (set <code>UdmEndDateTime</code>, <code>UdmActiveFlag=0</code>) via BCP staging + MERGE. <strong>INSERTs</strong>: append new version via BCP.
+              </div>
+              <span class="node-tag tag-scd2">SCD2</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-bronze"></div>
+              <span class="node-icon">💾</span>
+              <div class="node-title">Bronze Table</div>
+              <div class="node-desc">
+                <code>UDM_Bronze.{Source}.{Table}_scd2_python</code><br>
+                Append-only history. Adds <code>UdmHash</code>, <code>UdmEffectiveDateTime</code>, <code>UdmEndDateTime</code>, <code>UdmActiveFlag</code>, <code>UdmScd2Operation</code>.
+              </div>
+              <span class="node-tag tag-bronze">UDM_BRONZE</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- DIVIDER -->
+      <div class="layer-divider">
+        <div class="divider-spacer"></div>
+        <div class="divider-line">
+          <span class="divider-label">Observability</span>
+        </div>
+      </div>
+
+      <!-- ROW 6: OBS -->
+      <div class="stage-row">
+        <div class="stage-label"><span>Observe</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">📊</span>
+              <div class="node-title">PipelineEventLog</div>
+              <div class="node-desc">Event tracker: EXTRACT, CDC_PROMOTION, SCD2_PROMOTION, TABLE_TOTAL with row counts, timings, metadata JSON.</div>
+              <span class="node-tag tag-general">General.ops</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">📝</span>
+              <div class="node-title">PipelineLog</div>
+              <div class="node-desc">SQL Server log handler (buffer=10, WARNING+ flushes immediately). Python <code>logging.Handler</code>.</div>
+              <span class="node-tag tag-general">General.ops</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">🔬</span>
+              <div class="node-title">ReconciliationLog</div>
+              <div class="node-desc">Historical trending for reconciliation checks: counts, PKs, aggregates, distribution shift, referential integrity.</div>
+              <span class="node-tag tag-general">General.ops</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /pipeline -->
+  </div><!-- /flow-small -->
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- LARGE TABLES FLOW                          -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div id="flow-large" class="flow-section">
+    <div class="pipeline">
+
+      <!-- ROW 1: SOURCES -->
+      <div class="stage-row">
+        <div class="stage-label"><span>Sources</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node">
+              <div class="node-accent accent-oracle"></div>
+              <span class="node-icon">🔶</span>
+              <div class="node-title">Oracle (DNA)</div>
+              <div class="node-desc">oracledb (INDEX hint + <code>TRUNC()</code>) or ConnectorX windowed. Per-day extraction via <code>SourceAggregateColumnName</code>.</div>
+              <span class="node-tag tag-oracle">SOURCE</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-sqlserver"></div>
+              <span class="node-icon">🔷</span>
+              <div class="node-title">SQL Server (CCM, EPICOR)</div>
+              <div class="node-desc">ConnectorX windowed extraction. Per-day via <code>SourceAggregateColumnName</code>.</div>
+              <span class="node-tag tag-sqlserver">SOURCE</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">📋</span>
+              <div class="node-title">UdmTablesList + PipelineExtractionState</div>
+              <div class="node-desc">Metadata config + per-day checkpoint tracking. <code>LookbackDays</code>, <code>FirstLoadDate</code> drive extraction window.</div>
+              <span class="node-tag tag-general">METADATA</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">Extract single day → process → checkpoint → next day (memory-bounded loop)</span>
+        </div>
+      </div>
+
+      <!-- DIVIDER -->
+      <div class="layer-divider">
+        <div class="divider-spacer"></div>
+        <div class="divider-line">
+          <span class="divider-label">Per-Day Processing Loop</span>
+        </div>
+      </div>
+
+      <!-- ROW 2: PER-DAY EXTRACTION -->
+      <div class="stage-row">
+        <div class="stage-label"><span>Extract</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node wide-node">
+              <div class="node-accent accent-polars"></div>
+              <span class="node-icon">📅</span>
+              <div class="node-title">Windowed Extract (1 Day)</div>
+              <div class="node-desc">
+                <code>WHERE SourceAggregateCol BETWEEN day_start AND day_end</code>. oracledb uses distinct-date pre-query to skip empty days. <code>TRUNC()</code> prevents midnight boundary drift.
+              </div>
+              <span class="node-tag tag-polars">POLARS DataFrame</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-polars"></div>
+              <span class="node-icon">🔑</span>
+              <div class="node-title">Enrichment</div>
+              <div class="node-desc">
+                SHA-256 row hash + <code>_extracted_at</code>. Write BCP CSV per contract. Schema evolution + table lock (first day only).
+              </div>
+              <span class="node-tag tag-polars">TRANSFORM</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">Windowed CDC: compare only within extraction date window</span>
+        </div>
+      </div>
+
+      <!-- ROW 3: WINDOWED CDC -->
+      <div class="stage-row">
+        <div class="stage-label"><span>CDC</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node wide-node">
+              <div class="node-accent accent-stage"></div>
+              <span class="node-icon">🔍</span>
+              <div class="node-title">Windowed CDC</div>
+              <div class="node-desc">
+                Compare day's extract vs existing Stage rows for that date window only. INSERTs, UPDATEs detected. DELETEs scoped to extraction window — rows outside window untouched.
+              </div>
+              <span class="node-tag tag-cdc">CDC · P1-3/P1-4</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-bcp"></div>
+              <span class="node-icon">📥</span>
+              <div class="node-title">BCP → Stage</div>
+              <div class="node-desc">Day's changes loaded into <code>UDM_Stage.{Source}.{Table}_cdc</code> via BCP.</div>
+              <span class="node-tag tag-stage">UDM_STAGE</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">Targeted SCD2: PK-scoped Bronze read via staging table join</span>
+        </div>
+      </div>
+
+      <!-- ROW 4: TARGETED SCD2 -->
+      <div class="stage-row">
+        <div class="stage-label"><span>SCD2</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node wide-node">
+              <div class="node-accent accent-bronze"></div>
+              <span class="node-icon">🎯</span>
+              <div class="node-title">Targeted SCD2</div>
+              <div class="node-desc">
+                PK-scoped Bronze read (not full table). Close old versions via BCP staging + MERGE. Append new versions via BCP. Memory-bounded — never loads 3B+ row table.
+              </div>
+              <span class="node-tag tag-scd2">SCD2 · P1-3</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-bronze"></div>
+              <span class="node-icon">💾</span>
+              <div class="node-title">Bronze Table</div>
+              <div class="node-desc"><code>UDM_Bronze.{Source}.{Table}_scd2_python</code>. Append-only SCD2 history.</div>
+              <span class="node-tag tag-bronze">UDM_BRONZE</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ARROW -->
+      <div class="arrow-row">
+        <div class="arrow-spacer"></div>
+        <div class="arrow-track">
+          <div class="arrow-line"><div class="arrow-shaft"></div><div class="arrow-head"></div></div>
+          <span class="arrow-label">Checkpoint date → PipelineExtractionState (SUCCESS) → CSV cleanup → next day</span>
+        </div>
+      </div>
+
+      <!-- ROW 5: CHECKPOINT -->
+      <div class="stage-row">
+        <div class="stage-label"><span>State</span></div>
+        <div class="stage-content">
+          <div class="nodes">
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">✅</span>
+              <div class="node-title">Checkpoint & Recovery</div>
+              <div class="node-desc">Per-day status in <code>PipelineExtractionState</code>. On restart, resumes from last successful date and fills gaps. Failure on day 15/30 preserves days 1–14.</div>
+              <span class="node-tag tag-general">P1-5 / P1-6</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">🧹</span>
+              <div class="node-title">CSV Cleanup</div>
+              <div class="node-desc">Temp BCP CSV files removed after each day's successful load. Frees disk for next iteration.</div>
+              <span class="node-tag tag-bcp">CLEANUP</span>
+            </div>
+            <div class="node">
+              <div class="node-accent accent-general"></div>
+              <span class="node-icon">🔄</span>
+              <div class="node-title">LookbackDays Window</div>
+              <div class="node-desc">Rolling re-extraction window catches cross-day transaction overlap. Each date re-processed across N runs. CDC is idempotent.</div>
+              <span class="node-tag tag-general">V-7</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /pipeline -->
+  </div><!-- /flow-large -->
+
+  <!-- ═══════════════════════════════════════════ -->
+  <!-- LEGEND & METADATA                          -->
+  <!-- ═══════════════════════════════════════════ -->
+  <div class="legend">
+    <h3>Component Legend</h3>
+    <div class="legend-items">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--oracle)"></div> Oracle Source (DNA)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--sqlserver)"></div> SQL Server Source (CCM, EPICOR)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--polars)"></div> Polars DataFrame / Transform</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--bcp)"></div> BCP Bulk Load</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--stage)"></div> UDM_Stage (CDC Layer)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--bronze)"></div> UDM_Bronze (SCD2 Layer)</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--general)"></div> General DB / Metadata / Observability</div>
+    </div>
+  </div>
+
+  <div class="metadata-grid">
+    <div class="meta-card">
+      <h4>Table Naming Convention</h4>
+      <div class="meta-item"><span class="meta-key">Source</span><span class="meta-val">{SourceDB}.{Schema}.{Table}</span></div>
+      <div class="meta-item"><span class="meta-key">Stage</span><span class="meta-val">UDM_Stage.{SourceName}.{Table}_cdc</span></div>
+      <div class="meta-item"><span class="meta-key">Bronze</span><span class="meta-val">UDM_Bronze.{SourceName}.{Table}_scd2_python</span></div>
+      <div class="meta-item"><span class="meta-key">Schema</span><span class="meta-val">SourceName (DNA, CCM, EPICOR)</span></div>
+    </div>
+    <div class="meta-card">
+      <h4>BCP CSV Contract</h4>
+      <div class="meta-item"><span class="meta-key">Delimiter</span><span class="meta-val">Tab (\t)</span></div>
+      <div class="meta-item"><span class="meta-key">Row Term</span><span class="meta-val">LF only (0x0A)</span></div>
+      <div class="meta-item"><span class="meta-key">Quoting</span><span class="meta-val">Never</span></div>
+      <div class="meta-item"><span class="meta-key">NULL</span><span class="meta-val">Empty string</span></div>
+      <div class="meta-item"><span class="meta-key">Hash</span><span class="meta-val">SHA-256, VARCHAR(64)</span></div>
+      <div class="meta-item"><span class="meta-key">Batch</span><span class="meta-val">write_csv(batch_size=4096)</span></div>
+    </div>
+    <div class="meta-card">
+      <h4>Key Safeguards</h4>
+      <div class="meta-item"><span class="meta-key">P0-1</span><span class="meta-val">Column reorder to match target</span></div>
+      <div class="meta-item"><span class="meta-key">P0-2</span><span class="meta-val">Schema evolution (never drops)</span></div>
+      <div class="meta-item"><span class="meta-key">P0-3</span><span class="meta-val">Typed staging from actual PKs</span></div>
+      <div class="meta-item"><span class="meta-key">P0-4</span><span class="meta-val">NULL PK filter before CDC</span></div>
+      <div class="meta-item"><span class="meta-key">P1-1</span><span class="meta-val">Empty extraction guard</span></div>
+      <div class="meta-item"><span class="meta-key">P1-2</span><span class="meta-val">sp_getapplock table lock</span></div>
+    </div>
+    <div class="meta-card">
+      <h4>Tech Stack</h4>
+      <div class="meta-item"><span class="meta-key">Runtime</span><span class="meta-val">Python 3.12.11 on RHEL</span></div>
+      <div class="meta-item"><span class="meta-key">DataFrame</span><span class="meta-val">Polars + polars-hash</span></div>
+      <div class="meta-item"><span class="meta-key">Extraction</span><span class="meta-val">ConnectorX / oracledb</span></div>
+      <div class="meta-item"><span class="meta-key">Bulk Load</span><span class="meta-val">BCP (mssql-tools18)</span></div>
+      <div class="meta-item"><span class="meta-key">Connections</span><span class="meta-val">pyodbc / ODBC 18</span></div>
+      <div class="meta-item"><span class="meta-key">Oracle Client</span><span class="meta-val">Instant Client 19c</span></div>
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<script>
+  function showFlow(type) {
+    document.querySelectorAll('.flow-section').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.toggle-btn').forEach(el => el.classList.remove('active'));
+    document.getElementById('flow-' + type).classList.add('active');
+    event.target.classList.add('active');
+  }
+</script>
+</body>
+</html>

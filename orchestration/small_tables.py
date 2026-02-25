@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import config
+from data_load.schema_utils import clear_column_metadata_cache
 from extract.router import extract_full
 from schema.column_sync import sync_columns
 from observability.event_tracker import PipelineEventTracker
@@ -33,10 +34,6 @@ if TYPE_CHECKING:
     from orchestration.table_config import TableConfig
 
 logger = logging.getLogger(__name__)
-
-# Feature flags
-USE_POLARS_CDC = True
-USE_POLARS_SCD2 = True
 
 # P3-1: Small table size guard threshold.
 # If extraction exceeds this row count, log WARNING suggesting reclassification.
@@ -74,6 +71,10 @@ def process_small_table(
 
     table_name = table_config.source_object_name
     source_name = table_config.source_name
+
+    # M-5: Clear INFORMATION_SCHEMA cache at the start of each table's
+    # processing to handle schema evolution within a run.
+    clear_column_metadata_cache()
 
     # P1-2: Acquire table lock to prevent concurrent runs
     lock_conn = acquire_table_lock(source_name, table_name)

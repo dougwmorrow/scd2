@@ -134,6 +134,62 @@ def check_rss_memory(source_name: str, table_name: str) -> None:
         pass  # psutil not installed — skip RSS check
 
 
+def validate_cli_filters(
+    source_name: str | None,
+    table_name: str | None,
+) -> None:
+    """H-4: Validate --source and --table CLI arguments against UdmTablesList.
+
+    Belt-and-suspenders guard: even though H-3 parameterizes queries, this
+    catches typos early and prevents unexpected empty result sets.
+
+    Raises:
+        SystemExit: If the value is not found in UdmTablesList.
+    """
+    if source_name is None and table_name is None:
+        return
+
+    from orchestration.table_config import TableConfigLoader
+    loader = TableConfigLoader()
+
+    if source_name:
+        known_sources = loader.get_known_sources()
+        if source_name not in known_sources:
+            logger.error(
+                "H-4: --source '%s' not found in UdmTablesList. "
+                "Known sources: %s",
+                source_name, sorted(known_sources),
+            )
+            sys.exit(1)
+
+    if table_name:
+        known_tables = loader.get_known_tables()
+        if table_name not in known_tables:
+            logger.error(
+                "H-4: --table '%s' not found in UdmTablesList. "
+                "Known tables (first 20): %s",
+                table_name, sorted(known_tables)[:20],
+            )
+            sys.exit(1)
+
+
+def log_connection_overhead() -> None:
+    """P-3: Log cumulative connection overhead at pipeline end."""
+    from connections import get_connection_overhead
+    total_ms, count = get_connection_overhead()
+    if count > 0:
+        logger.info(
+            "P-3: Connection overhead: %.1f ms total across %d connections (%.1f ms avg)",
+            total_ms, count, total_ms / count,
+        )
+
+
+def shutdown_connections() -> None:
+    """Item-18: Close pooled connections at pipeline shutdown."""
+    from connections import close_connection_pool
+    close_connection_pool()
+
+
 def table_config_to_dict(tc, batch_id: int) -> dict:
     """Serialize a TableConfig for cross-process transfer via ProcessPoolExecutor.
 

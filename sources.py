@@ -79,4 +79,10 @@ def get_source(name: str) -> SourceSystem:
 
 
 def register_source(source: SourceSystem) -> None:
+    """Register a new source system at runtime.
+
+    Intended for programmatic source registration (e.g., loading sources from a
+    config file or adding test fixtures). Not currently called by production code —
+    all production sources are statically defined in _SOURCES above.
+    """
     _SOURCES[source.name.upper()] = source

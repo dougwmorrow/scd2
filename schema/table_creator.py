@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 import connections
+from connections import quote_identifier, quote_table
 from extract.udm_connectorx_extractor import table_exists
 
 if TYPE_CHECKING:
@@ -113,23 +114,34 @@ def ensure_stage_table(table_config: TableConfig, df: pl.DataFrame) -> bool:
 
     parts = full_name.split(".")
     db, schema, table = parts[0], parts[1], parts[2]
-
-    ddl = f"""
-    IF NOT EXISTS (SELECT 1 FROM [{db}].INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}')
-    BEGIN
-        IF NOT EXISTS (SELECT 1 FROM [{db}].sys.schemas WHERE name = '{schema}')
-            EXEC('{db}..sp_executesql N''CREATE SCHEMA [{schema}]''')
-
-        CREATE TABLE {full_name} (
-{col_ddl}
-        )
-    END
-    """
+    q_db = quote_identifier(db)
+    q_schema = quote_identifier(schema)
+    q_full = quote_table(full_name)
 
     conn = connections.get_connection(db)
     try:
         cursor = conn.cursor()
-        cursor.execute(ddl)
+        # Check if table already exists (parameterized)
+        cursor.execute(
+            f"SELECT 1 FROM {q_db}.INFORMATION_SCHEMA.TABLES "
+            f"WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            schema, table,
+        )
+        if cursor.fetchone():
+            cursor.close()
+            conn.close()
+            logger.info("Created Stage table: %s (already existed)", full_name)
+            return True
+
+        # Ensure schema exists
+        cursor.execute(
+            f"SELECT 1 FROM {q_db}.sys.schemas WHERE name = ?", schema,
+        )
+        if not cursor.fetchone():
+            cursor.execute(f"EXEC({q_db}..sp_executesql N'CREATE SCHEMA {q_schema}')")
+
+        # Create table
+        cursor.execute(f"CREATE TABLE {q_full} (\n{col_ddl}\n)")
         cursor.close()
         logger.info("Created Stage table: %s", full_name)
     finally:
@@ -178,23 +190,34 @@ def ensure_bronze_table(table_config: TableConfig, df: pl.DataFrame) -> bool:
 
     parts = full_name.split(".")
     db, schema, table = parts[0], parts[1], parts[2]
-
-    ddl = f"""
-    IF NOT EXISTS (SELECT 1 FROM [{db}].INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}')
-    BEGIN
-        IF NOT EXISTS (SELECT 1 FROM [{db}].sys.schemas WHERE name = '{schema}')
-            EXEC('{db}..sp_executesql N''CREATE SCHEMA [{schema}]''')
-
-        CREATE TABLE {full_name} (
-{col_ddl}
-        )
-    END
-    """
+    q_db = quote_identifier(db)
+    q_schema = quote_identifier(schema)
+    q_full = quote_table(full_name)
 
     conn = connections.get_connection(db)
     try:
         cursor = conn.cursor()
-        cursor.execute(ddl)
+        # Check if table already exists (parameterized)
+        cursor.execute(
+            f"SELECT 1 FROM {q_db}.INFORMATION_SCHEMA.TABLES "
+            f"WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+            schema, table,
+        )
+        if cursor.fetchone():
+            cursor.close()
+            conn.close()
+            logger.info("Created Bronze table: %s (already existed)", full_name)
+            return True
+
+        # Ensure schema exists
+        cursor.execute(
+            f"SELECT 1 FROM {q_db}.sys.schemas WHERE name = ?", schema,
+        )
+        if not cursor.fetchone():
+            cursor.execute(f"EXEC({q_db}..sp_executesql N'CREATE SCHEMA {q_schema}')")
+
+        # Create table
+        cursor.execute(f"CREATE TABLE {q_full} (\n{col_ddl}\n)")
         cursor.close()
         logger.info("Created Bronze table: %s", full_name)
     finally:
@@ -237,7 +260,7 @@ def ensure_bronze_unique_active_index(
     db, schema, table = parts[0], parts[1], parts[2]
 
     index_name = f"UX_Active_{table_config.source_object_name}"
-    pk_col_list = ", ".join(f"[{c}]" for c in pk_columns)
+    pk_col_list = ", ".join(quote_identifier(c) for c in pk_columns)
 
     conn = connections.get_connection(db)
     try:
@@ -257,9 +280,10 @@ def ensure_bronze_unique_active_index(
             return False
 
         # Create unique filtered index
+        q_full = quote_table(full_name)
         ddl = (
-            f"CREATE UNIQUE NONCLUSTERED INDEX [{index_name}] "
-            f"ON {full_name} ({pk_col_list}) "
+            f"CREATE UNIQUE NONCLUSTERED INDEX {quote_identifier(index_name)} "
+            f"ON {q_full} ({pk_col_list}) "
             f"WHERE [UdmActiveFlag] = 1"
         )
         cursor.execute(ddl)
@@ -308,7 +332,7 @@ def ensure_bronze_point_in_time_index(
     db = parts[0]
 
     index_name = f"IX_PIT_{table_config.source_object_name}"
-    pk_col_list = ", ".join(f"[{c}]" for c in pk_columns)
+    pk_col_list = ", ".join(quote_identifier(c) for c in pk_columns)
 
     conn = connections.get_connection(db)
     try:
@@ -327,9 +351,10 @@ def ensure_bronze_point_in_time_index(
             cursor.close()
             return False
 
+        q_full = quote_table(full_name)
         ddl = (
-            f"CREATE NONCLUSTERED INDEX [{index_name}] "
-            f"ON {full_name} ({pk_col_list}, [UdmEffectiveDateTime] DESC)"
+            f"CREATE NONCLUSTERED INDEX {quote_identifier(index_name)} "
+            f"ON {q_full} ({pk_col_list}, [UdmEffectiveDateTime] DESC)"
         )
         cursor.execute(ddl)
         cursor.close()
@@ -406,7 +431,7 @@ def ensure_bronze_columnstore_index(
         return False
 
     cci_name = f"CCI_{table_config.source_object_name}"
-    order_cols = ", ".join(f"[{c}]" for c in pk_columns) + ", [UdmEffectiveDateTime]"
+    order_cols = ", ".join(quote_identifier(c) for c in pk_columns) + ", [UdmEffectiveDateTime]"
 
     conn = connections.get_connection(db)
     try:
@@ -437,6 +462,8 @@ def ensure_bronze_columnstore_index(
             cursor.close()
             return False
 
+        q_full = quote_table(full_name)
+
         # Step 1: Drop existing clustered PK and recreate as nonclustered
         # Find the current PK constraint name
         cursor.execute(
@@ -451,18 +478,18 @@ def ensure_bronze_columnstore_index(
                 "W-10: Dropping clustered PK [%s] on %s to make room for columnstore",
                 pk_name, full_name,
             )
-            cursor.execute(f"ALTER TABLE {full_name} DROP CONSTRAINT [{pk_name}]")
+            cursor.execute(f"ALTER TABLE {q_full} DROP CONSTRAINT {quote_identifier(pk_name)}")
             # Recreate PK as nonclustered
             cursor.execute(
-                f"ALTER TABLE {full_name} ADD CONSTRAINT [{pk_name}] "
+                f"ALTER TABLE {q_full} ADD CONSTRAINT {quote_identifier(pk_name)} "
                 f"PRIMARY KEY NONCLUSTERED ([_scd2_key])"
             )
             logger.info("W-10: Recreated PK [%s] as NONCLUSTERED on %s", pk_name, full_name)
 
         # Step 2: Create ordered clustered columnstore index
         ddl = (
-            f"CREATE CLUSTERED COLUMNSTORE INDEX [{cci_name}] "
-            f"ON {full_name} ORDER ({order_cols})"
+            f"CREATE CLUSTERED COLUMNSTORE INDEX {quote_identifier(cci_name)} "
+            f"ON {q_full} ORDER ({order_cols})"
         )
         cursor.execute(ddl)
         cursor.close()

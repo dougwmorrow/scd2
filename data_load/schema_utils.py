@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 
 import polars as pl
 
 import connections
+from connections import quote_identifier
 
 logger = logging.getLogger(__name__)
+
+# M-5: Module-level cache version counter. Increment to invalidate all
+# cached column metadata (e.g., after schema evolution within a run).
+_cache_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -50,11 +56,30 @@ class ColumnMetadata:
 def get_column_metadata(full_table_name: str) -> list[ColumnMetadata]:
     """Read column metadata from INFORMATION_SCHEMA.COLUMNS, ordered by ORDINAL_POSITION.
 
+    M-4: Results are cached per table name to avoid repeated INFORMATION_SCHEMA
+    queries within a single table's processing. Cache is invalidated via
+    clear_column_metadata_cache() at the start of each table's processing
+    to handle schema evolution within a run.
+
     Args:
         full_table_name: e.g. 'UDM_Stage.DNA.ACCT_cdc'
 
     Returns:
         List of ColumnMetadata, ordered by ORDINAL_POSITION.
+    """
+    return _get_column_metadata_cached(full_table_name, _cache_version)
+
+
+@lru_cache(maxsize=128)
+def _get_column_metadata_cached(
+    full_table_name: str,
+    cache_version: int,  # noqa: ARG001 — used only for cache invalidation
+) -> list[ColumnMetadata]:
+    """M-4: Cached implementation of get_column_metadata().
+
+    The cache_version parameter is not used in the function body — it exists
+    solely as part of the cache key so that incrementing _cache_version
+    causes cache misses, effectively clearing the cache.
     """
     parts = full_table_name.split(".")
     db, schema, table = parts[0], parts[1], parts[2]
@@ -65,7 +90,7 @@ def get_column_metadata(full_table_name: str) -> list[ColumnMetadata]:
         cursor.execute(
             f"SELECT COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE, "
             f"CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE "
-            f"FROM [{db}].INFORMATION_SCHEMA.COLUMNS "
+            f"FROM {quote_identifier(db)}.INFORMATION_SCHEMA.COLUMNS "
             f"WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? "
             f"ORDER BY ORDINAL_POSITION",
             schema, table,
@@ -86,6 +111,18 @@ def get_column_metadata(full_table_name: str) -> list[ColumnMetadata]:
         )
         for row in rows
     ]
+
+
+def clear_column_metadata_cache() -> None:
+    """M-5: Invalidate the column metadata cache.
+
+    Call at the start of each table's processing to handle schema evolution
+    within a run. Incrementing _cache_version causes all subsequent calls
+    to _get_column_metadata_cached to miss the cache.
+    """
+    global _cache_version
+    _cache_version += 1
+    logger.debug("M-5: Column metadata cache invalidated (version=%d)", _cache_version)
 
 
 def get_target_column_order(

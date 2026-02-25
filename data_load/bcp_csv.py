@@ -47,6 +47,10 @@ from data_load.bcp_format import generate_bcp_format_file  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# M-7: Track whether BOM check has run at least once this pipeline session.
+# Polars never writes BOMs — one verification per run is sufficient.
+_bom_verified: bool = False
+
 
 class SchemaValidationError(Exception):
     """W-7: Raised when DataFrame schemas don't match before concatenation."""
@@ -124,22 +128,32 @@ def _validate_sanitized(df: pl.DataFrame) -> None:
             )
 
 
-def write_bcp_csv(df: pl.DataFrame, path: str | Path) -> Path:
+def write_bcp_csv(
+    df: pl.DataFrame,
+    path: str | Path,
+    validate: bool = True,
+) -> Path:
     """Write DataFrame to BCP CSV file following the BCP CSV Contract.
 
     Args:
         df: DataFrame to write (must already be sanitized/cast).
         path: Output file path.
+        validate: M-6: If True (default), validate string columns are sanitized
+                  before writing. Internal callers that have already run
+                  sanitize_strings() can pass False to skip redundant validation.
 
     Returns:
         Path to the written CSV file.
     """
+    global _bom_verified
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # B-1: Validate that string columns have been sanitized before writing.
     # quote_style='never' means any remaining \t \n \r will corrupt the CSV.
-    _validate_sanitized(df)
+    # M-6: Skip validation when caller guarantees sanitization.
+    if validate:
+        _validate_sanitized(df)
 
     df.write_csv(
         path,
@@ -151,11 +165,11 @@ def write_bcp_csv(df: pl.DataFrame, path: str | Path) -> Path:
         batch_size=config.CSV_BATCH_SIZE,
     )
 
-    # V-6: BOM detection guard — Polars does not write BOMs by default, but
-    # platform quirks, intermediate processing, or future regressions could
-    # introduce one. A BOM (0xEF 0xBB 0xBF) prepended to the file corrupts
-    # the first field of the first row (e.g. PK "12345" becomes "\xEF\xBB\xBF12345").
-    _strip_bom_if_present(path)
+    # V-6 + M-7: BOM detection guard. Polars never writes BOMs — run only on
+    # the first write per pipeline session to verify, then skip subsequent files.
+    if not _bom_verified:
+        _strip_bom_if_present(path)
+        _bom_verified = True
 
     logger.info("Wrote BCP CSV: %s (%d rows)", path, len(df))
     return path
@@ -186,6 +200,7 @@ def prepare_dataframe_for_bcp(
     bit_columns: list[str] | None = None,
     fix_oracle_dates: bool = False,
     source_is_oracle: bool = False,
+    stage_table: str | None = None,
 ) -> pl.DataFrame:
     """Full pipeline: fix dates -> hash -> timestamp -> sanitize -> cast -> reinterpret.
 
@@ -196,12 +211,15 @@ def prepare_dataframe_for_bcp(
         bit_columns: Explicit list of BIT columns, or None to auto-detect Booleans.
         fix_oracle_dates: Whether to fix Oracle DATE columns returned as Utf8.
         source_is_oracle: E-1 — If True, normalize empty strings to NULL before hashing.
+        stage_table: Item-20 — Optional Stage table name for INFORMATION_SCHEMA lookup.
+            When provided, columns typed as VARCHAR/NVARCHAR/CHAR in the Stage table
+            are excluded from content-based datetime detection to prevent false positives.
 
     Returns:
         DataFrame ready for write_bcp_csv().
     """
     if fix_oracle_dates:
-        df = fix_oracle_date_columns(df)
+        df = fix_oracle_date_columns(df, stage_table=stage_table)
 
     df = add_row_hash(df, source_is_oracle=source_is_oracle)
     df = add_extracted_at(df)

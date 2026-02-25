@@ -80,6 +80,7 @@ B-14 NOTE — INSERT-first zero-active-row window:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -90,6 +91,7 @@ import polars as pl
 
 import config
 import connections
+from connections import quote_identifier, quote_table
 from data_load import bcp_loader
 from data_load.bcp_csv import validate_schema_before_concat, write_bcp_csv
 from data_load.sanitize import cast_bit_columns, reorder_columns_for_bcp, sanitize_strings
@@ -115,6 +117,7 @@ class SCD2Result:
     new_versions: int = 0
     closes: int = 0
     unchanged: int = 0
+    resurrections: int = 0
 
 
 def run_scd2(
@@ -264,6 +267,17 @@ def run_scd2(
         table_config.source_object_name,
         result.inserts, result.new_versions, result.closes, result.unchanged,
     )
+    # O-2: Structured JSON for SCD2 signals.
+    logger.info(
+        "O-2_SCD2: %s",
+        json.dumps({
+            "signal": "scd2_result", "source": table_config.source_name,
+            "table": table_config.source_object_name, "mode": "full",
+            "inserts": result.inserts, "new_versions": result.new_versions,
+            "closes": result.closes, "unchanged": result.unchanged,
+            "resurrections": result.resurrections,
+        }),
+    )
 
     # P0-8: INSERT first, THEN UPDATE. A crash after insert but before update
     # leaves duplicate active rows (recoverable via next run's comparison),
@@ -281,6 +295,7 @@ def run_scd2(
     if resurrection_pks is not None and len(resurrection_pks) > 0:
         df_resurrected = df_current.join(resurrection_pks, on=pk_columns, how="semi")
         insert_parts.append(_build_scd2_insert(df_resurrected, source_cols, pk_columns, now, "R"))
+        result.resurrections = len(df_resurrected)
         result.inserts += len(df_resurrected)
 
     if insert_parts:
@@ -343,7 +358,8 @@ def _check_duplicate_active_rows(
     if not table_exists(bronze_table):
         return 0
 
-    pk_group = ", ".join(f"[{c}]" for c in pk_columns)
+    pk_group = ", ".join(quote_identifier(c) for c in pk_columns)
+    q_bronze = quote_table(bronze_table)
 
     db = bronze_table.split(".")[0]
     conn = connections.get_connection(db)
@@ -352,7 +368,7 @@ def _check_duplicate_active_rows(
         cursor.execute(f"""
             SELECT COUNT(*) FROM (
                 SELECT {pk_group}
-                FROM {bronze_table}
+                FROM {q_bronze}
                 WHERE UdmActiveFlag = 1
                 GROUP BY {pk_group}
                 HAVING COUNT(*) > 1
@@ -525,6 +541,8 @@ def _execute_bronze_updates(
     db = bronze_table.split(".")[0]
     schema = bronze_table.split(".")[1]
     staging_table = f"{db}.{schema}._staging_scd2_{table_config.source_object_name}"
+    q_staging = quote_table(staging_table)
+    q_bronze = quote_table(bronze_table)
 
     # P0-3: Use actual PK column types from target table instead of NVARCHAR(MAX)
     pk_types = get_column_types(bronze_table, pk_columns)
@@ -532,11 +550,9 @@ def _execute_bronze_updates(
     conn = connections.get_connection(db)
     try:
         cursor = conn.cursor()
-        pk_col_defs = ", ".join(f"[{c}] {pk_types[c]}" for c in pk_columns)
-        cursor.execute(f"""
-            IF OBJECT_ID('{staging_table}', 'U') IS NOT NULL DROP TABLE {staging_table};
-            CREATE TABLE {staging_table} ({pk_col_defs})
-        """)
+        pk_col_defs = ", ".join(f"{quote_identifier(c)} {pk_types[c]}" for c in pk_columns)
+        cursor.execute(f"IF OBJECT_ID(?, 'U') IS NOT NULL DROP TABLE {q_staging}", staging_table)
+        cursor.execute(f"CREATE TABLE {q_staging} ({pk_col_defs})")
         cursor.close()
     finally:
         conn.close()
@@ -589,7 +605,7 @@ def _execute_bronze_updates(
         # locks. Table-level exclusive locks override RCSI, blocking all readers.
         # Keep batch size below 5,000 to maintain row-level locking.
         join_condition = " AND ".join(
-            f"t.[{c}] = s.[{c}]" for c in pk_columns
+            f"t.{quote_identifier(c)} = s.{quote_identifier(c)}" for c in pk_columns
         )
 
         _SCD3_BATCH_SIZE = config.SCD2_UPDATE_BATCH_SIZE
@@ -603,8 +619,8 @@ def _execute_bronze_updates(
                 cursor.execute(f"""
                     UPDATE t
                     SET t.UdmActiveFlag = 0, t.UdmEndDateTime = ?
-                    FROM {bronze_table} t
-                    INNER JOIN {staging_table} s ON {join_condition}
+                    FROM {q_bronze} t
+                    INNER JOIN {q_staging} s ON {join_condition}
                     WHERE t.UdmActiveFlag = 1
                 """, end_dt)
                 total_affected = cursor.rowcount
@@ -630,12 +646,12 @@ def _execute_bronze_updates(
                     # The WHERE UdmActiveFlag=1 filter ensures already-processed
                     # rows aren't touched again, providing natural convergence.
                     cursor.execute(f"""
-                        UPDATE TOP ({_SCD3_BATCH_SIZE}) t
+                        UPDATE TOP (?) t
                         SET t.UdmActiveFlag = 0, t.UdmEndDateTime = ?
-                        FROM {bronze_table} t
-                        INNER JOIN {staging_table} s ON {join_condition}
+                        FROM {q_bronze} t
+                        INNER JOIN {q_staging} s ON {join_condition}
                         WHERE t.UdmActiveFlag = 1
-                    """, end_dt)
+                    """, _SCD3_BATCH_SIZE, end_dt)
                     batch_affected = cursor.rowcount
                     cursor.close()
                     total_affected += batch_affected
@@ -675,7 +691,7 @@ def _execute_bronze_updates(
         conn = connections.get_connection(db)
         try:
             cursor = conn.cursor()
-            cursor.execute(f"DROP TABLE IF EXISTS {staging_table}")
+            cursor.execute(f"DROP TABLE IF EXISTS {q_staging}")
             cursor.close()
         finally:
             conn.close()
@@ -708,11 +724,12 @@ def _activate_new_versions(
         Number of rows activated.
     """
     db = bronze_table.split(".")[0]
+    q_bronze = quote_table(bronze_table)
     conn = connections.get_connection(db)
     try:
         cursor = conn.cursor()
         cursor.execute(f"""
-            UPDATE {bronze_table}
+            UPDATE {q_bronze}
             SET UdmActiveFlag = 1
             WHERE UdmActiveFlag = 0
               AND UdmEndDateTime IS NULL
@@ -771,12 +788,14 @@ def _cleanup_orphaned_inactive_rows(
     db = bronze_table.split(".")[0]
 
     try:
+        q_bronze = quote_table(bronze_table)
+
         # Check for orphaned rows
         conn = connections.get_connection(db)
         try:
             cursor = conn.cursor()
             cursor.execute(f"""
-                SELECT COUNT(*) FROM {bronze_table}
+                SELECT COUNT(*) FROM {q_bronze}
                 WHERE UdmActiveFlag = 0
                   AND UdmEndDateTime IS NULL
                   AND UdmScd2Operation IN ('U', 'R')
@@ -805,11 +824,11 @@ def _cleanup_orphaned_inactive_rows(
             while True:
                 cursor = conn.cursor()
                 cursor.execute(f"""
-                    DELETE TOP ({batch_size}) FROM {bronze_table}
+                    DELETE TOP (?) FROM {q_bronze}
                     WHERE UdmActiveFlag = 0
                       AND UdmEndDateTime IS NULL
                       AND UdmScd2Operation IN ('U', 'R')
-                """)
+                """, batch_size)
                 deleted = cursor.rowcount
                 cursor.close()
                 total_deleted += deleted
@@ -1078,6 +1097,7 @@ def run_scd2_targeted(
     if targeted_resurrection_pks is not None and len(targeted_resurrection_pks) > 0:
         df_resurrected = df_current.join(targeted_resurrection_pks, on=pk_columns, how="semi")
         insert_parts.append(_build_scd2_insert(df_resurrected, source_cols, pk_columns, now, "R"))
+        result.resurrections = len(df_resurrected)
         result.inserts += len(df_resurrected)
         # Close the old versions for resurrected PKs too
         pks_to_close_parts.append(targeted_resurrection_pks)
@@ -1119,6 +1139,17 @@ def run_scd2_targeted(
         "Targeted SCD2 %s: inserts=%d, new_versions=%d, closes=%d, unchanged=%d",
         table_config.source_object_name,
         result.inserts, result.new_versions, result.closes, result.unchanged,
+    )
+    # O-2: Structured JSON for targeted SCD2 signals.
+    logger.info(
+        "O-2_SCD2: %s",
+        json.dumps({
+            "signal": "scd2_result", "source": table_config.source_name,
+            "table": table_config.source_object_name, "mode": "targeted",
+            "inserts": result.inserts, "new_versions": result.new_versions,
+            "closes": result.closes, "unchanged": result.unchanged,
+            "resurrections": result.resurrections,
+        }),
     )
 
     # V-4: Post-SCD2 duplicate active row check (non-blocking diagnostic).

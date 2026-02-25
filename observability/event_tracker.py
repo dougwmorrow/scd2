@@ -75,7 +75,11 @@ class PipelineEventTracker:
             row = cursor.fetchone()
             batch_id = int(row[0])
             cursor.close()
-            conn.commit()  # OBS-5: Explicit commit for batch ID INSERT
+            # OBS-5 + R-4: Explicit commit — required even under autocommit=True
+            # as a defensive guard against future connection configuration changes.
+            # Under the current autocommit=True setting, this is a no-op but ensures
+            # the INSERT persists if autocommit is ever disabled.
+            conn.commit()
             return batch_id
         finally:
             conn.close()

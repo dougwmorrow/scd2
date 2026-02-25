@@ -108,23 +108,56 @@ class TableConfig:
 
 
 class TableConfigLoader:
-    """Loads table configs from General.dbo.UdmTablesList via ConnectorX."""
+    """Loads table configs from General.dbo.UdmTablesList.
+
+    Uses ConnectorX for unfiltered bulk reads and pyodbc for filtered queries
+    (H-3: parameterized queries prevent SQL injection on user-supplied values).
+    """
 
     def __init__(self) -> None:
         self._uri = connections.general_connectorx_uri()
 
-    def _load_tables_df(self, where_clause: str = "") -> pl.DataFrame:
-        query = (
-            "SELECT SourceObjectName, SourceServer, SourceDatabase, "
-            "SourceSchemaName, SourceName, StageTableName, BronzeTableName, "
-            "SourceAggregateColumnName, SourceAggregateColumnType, "
-            "SourceIndexHint, PartitionOn, FirstLoadDate, LookbackDays, "
-            "StageLoadTool "
-            "FROM dbo.UdmTablesList"
-        )
-        if where_clause:
-            query += f" WHERE {where_clause}"
-        return cx.read_sql(self._uri, query, return_type="polars")
+    _TABLES_SELECT = (
+        "SELECT SourceObjectName, SourceServer, SourceDatabase, "
+        "SourceSchemaName, SourceName, StageTableName, BronzeTableName, "
+        "SourceAggregateColumnName, SourceAggregateColumnType, "
+        "SourceIndexHint, PartitionOn, FirstLoadDate, LookbackDays, "
+        "StageLoadTool "
+        "FROM dbo.UdmTablesList"
+    )
+
+    def _load_tables_df(
+        self,
+        conditions: list[str] | None = None,
+        params: list | None = None,
+    ) -> pl.DataFrame:
+        """Load table list with optional parameterized WHERE clause.
+
+        H-3: When conditions contain parameter placeholders (?), uses pyodbc
+        for safe parameterized execution. Otherwise uses ConnectorX for speed.
+        """
+        if conditions:
+            where = " WHERE " + " AND ".join(conditions)
+            if params:
+                # H-3: Use pyodbc for parameterized queries (user-supplied values)
+                conn = connections.get_general_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(self._TABLES_SELECT + where, *params)
+                    columns = [desc[0] for desc in cursor.description]
+                    rows = cursor.fetchall()
+                    cursor.close()
+                    if not rows:
+                        return pl.DataFrame(schema={c: pl.Utf8 for c in columns})
+                    return pl.DataFrame(
+                        [dict(zip(columns, row)) for row in rows],
+                    )
+                finally:
+                    conn.close()
+            else:
+                # No params — safe static conditions, use ConnectorX
+                return cx.read_sql(self._uri, self._TABLES_SELECT + where, return_type="polars")
+        return cx.read_sql(self._uri, self._TABLES_SELECT, return_type="polars")
 
     def _load_columns_df(self) -> pl.DataFrame:
         query = (
@@ -185,13 +218,15 @@ class TableConfigLoader:
             "SourceAggregateColumnName IS NULL",
             "StageLoadTool = 'Python'",
         ]
+        params: list = []
         if source_name:
-            conditions.append(f"SourceName = '{source_name}'")
+            conditions.append("SourceName = ?")
+            params.append(source_name)
         if table_name:
-            conditions.append(f"SourceObjectName = '{table_name}'")
+            conditions.append("SourceObjectName = ?")
+            params.append(table_name)
 
-        where = " AND ".join(conditions)
-        tables_df = self._load_tables_df(where)
+        tables_df = self._load_tables_df(conditions, params or None)
         columns_df = self._load_columns_df()
         configs = self._build_configs(tables_df, columns_df)
         logger.info("Loaded %d small table configs", len(configs))
@@ -202,14 +237,34 @@ class TableConfigLoader:
             "SourceAggregateColumnName IS NOT NULL",
             "StageLoadTool = 'Python'",
         ]
+        params: list = []
         if source_name:
-            conditions.append(f"SourceName = '{source_name}'")
+            conditions.append("SourceName = ?")
+            params.append(source_name)
         if table_name:
-            conditions.append(f"SourceObjectName = '{table_name}'")
+            conditions.append("SourceObjectName = ?")
+            params.append(table_name)
 
-        where = " AND ".join(conditions)
-        tables_df = self._load_tables_df(where)
+        tables_df = self._load_tables_df(conditions, params or None)
         columns_df = self._load_columns_df()
         configs = self._build_configs(tables_df, columns_df)
         logger.info("Loaded %d large table configs", len(configs))
         return configs
+
+    def get_known_sources(self) -> set[str]:
+        """H-4: Get all known source names from UdmTablesList for CLI validation."""
+        df = cx.read_sql(
+            self._uri,
+            "SELECT DISTINCT SourceName FROM dbo.UdmTablesList",
+            return_type="polars",
+        )
+        return set(df["SourceName"].to_list())
+
+    def get_known_tables(self) -> set[str]:
+        """H-4: Get all known table names from UdmTablesList for CLI validation."""
+        df = cx.read_sql(
+            self._uri,
+            "SELECT DISTINCT SourceObjectName FROM dbo.UdmTablesList",
+            return_type="polars",
+        )
+        return set(df["SourceObjectName"].to_list())

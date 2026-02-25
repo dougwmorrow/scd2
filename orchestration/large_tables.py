@@ -22,12 +22,15 @@ Architecture decisions:
 
 from __future__ import annotations
 
+import gc
 import logging
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import config
+from connections import quote_identifier
+from data_load.schema_utils import clear_column_metadata_cache
 from extract.router import extract_windowed
 from schema.column_sync import sync_columns
 from observability.event_tracker import PipelineEventTracker
@@ -42,10 +45,6 @@ if TYPE_CHECKING:
     from orchestration.table_config import TableConfig
 
 logger = logging.getLogger(__name__)
-
-# Feature flags
-USE_POLARS_CDC = True
-USE_POLARS_SCD2 = True
 
 # P2-6: Only disable/rebuild indexes if inserts exceed this fraction of existing rows.
 # For a 3B-row table with 50K daily inserts, index rebuild is counterproductive.
@@ -84,6 +83,9 @@ def process_large_table(
     table_name = table_config.source_object_name
     source_name = table_config.source_name
     date_column = table_config.source_aggregate_column_name
+
+    # M-5: Clear INFORMATION_SCHEMA cache at the start of each table's processing.
+    clear_column_metadata_cache()
 
     if not date_column:
         logger.error(
@@ -366,6 +368,12 @@ def _process_single_day(
     # and cdc_result.deleted_pks. The original extraction df is no longer needed.
     extracted_row_count = len(df)
     del df
+    # Item-19: Explicit gc.collect() ensures the extraction DataFrame's memory
+    # is returned to the allocator before SCD2 allocates. Without this, Python's
+    # cyclic GC may not run until memory pressure is high. Combined with
+    # MALLOC_ARENA_MAX=2 (W-4) and shrink_to_fit() (W-12), this closes the last
+    # gap in the memory management chain at the extraction→SCD2 transition point.
+    gc.collect()
     _check_memory_pressure(source_name, table_name, target_date)
 
     # --- TARGETED SCD2 (P1-3) ---
@@ -406,12 +414,14 @@ def _check_null_date_column(
             conn_uri = source.connectorx_uri()
 
         import connectorx as cx
+        # Item-14: Use quote_identifier for SQL Server path (H-1 consistency).
+        # Oracle path uses double-quote escaping for identifier safety.
         query = (
             f"SELECT COUNT(*) AS null_count FROM {table_config.source_full_table_name} "
-            f"WHERE [{date_column}] IS NULL"
+            f"WHERE {quote_identifier(date_column)} IS NULL"
         ) if source.source_type != SourceType.ORACLE else (
             f"SELECT COUNT(*) AS null_count FROM {table_config.source_full_table_name} "
-            f"WHERE {date_column} IS NULL"
+            f'WHERE "{date_column}" IS NULL'
         )
 
         df = cx.read_sql(conn_uri, query, return_type="polars")

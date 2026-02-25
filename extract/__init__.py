@@ -73,15 +73,11 @@ def cx_read_sql_safe(
             last_error = e
             error_type = type(e).__name__
 
-            # Check if error is non-retryable (syntax errors, permission issues)
+            # O-3: Categorized retry logic — distinguish transient from permanent errors.
+            # Transient: connection reset, timeout, Oracle listener, SQL Server busy.
+            # Permanent: syntax, permissions, missing objects — fail immediately.
             error_str = str(e).lower()
-            non_retryable = (
-                "syntax" in error_str
-                or "permission" in error_str
-                or "does not exist" in error_str
-                or "invalid column" in error_str
-                or "invalid object" in error_str
-            )
+            non_retryable = _is_non_retryable_error(error_str, error_type)
 
             if non_retryable or attempt == max_retries:
                 if attempt > 1:
@@ -108,3 +104,69 @@ def cx_read_sql_safe(
 
     # Should not reach here, but satisfy type checker
     raise last_error  # type: ignore[misc]
+
+
+# O-3: Non-retryable error patterns for ConnectorX.
+# SQL syntax, permissions, and object-not-found errors are permanent —
+# retrying only wastes time and obscures the root cause.
+_NON_RETRYABLE_PATTERNS = (
+    # SQL Server permanent errors
+    "syntax",
+    "permission",
+    "does not exist",
+    "invalid column",
+    "invalid object",
+    "login failed",
+    "access denied",
+    # Oracle permanent errors (ORA- codes)
+    "ora-00942",      # table or view does not exist
+    "ora-00904",      # invalid identifier
+    "ora-01017",      # invalid username/password
+    "ora-01031",      # insufficient privileges
+    "ora-00933",      # SQL command not properly ended (syntax)
+    "ora-06550",      # PL/SQL compilation error
+)
+
+# O-3: Transient error patterns — these SHOULD be retried.
+# Listed for documentation; if an error matches a transient pattern,
+# it is explicitly NOT classified as non-retryable.
+_TRANSIENT_PATTERNS = (
+    "ora-12541",      # TNS:no listener
+    "ora-12170",      # TNS:connect timeout
+    "ora-03135",      # connection lost contact
+    "ora-03113",      # end-of-file on communication channel
+    "ora-12537",      # TNS:connection closed
+    "connection reset",
+    "connection refused",
+    "timeout",
+    "timed out",
+    "broken pipe",
+    "network",
+    "server is not available",
+)
+
+
+def _is_non_retryable_error(error_str: str, error_type: str) -> bool:
+    """O-3: Classify ConnectorX errors as retryable or permanent.
+
+    Returns True if the error should NOT be retried (syntax, permissions,
+    missing objects). Returns False for transient errors that may succeed
+    on retry (connection issues, timeouts).
+    """
+    # Check transient patterns first — if it matches a known transient
+    # pattern, always retry even if it also matches a non-retryable pattern
+    for pattern in _TRANSIENT_PATTERNS:
+        if pattern in error_str:
+            return False
+
+    # Check non-retryable patterns
+    for pattern in _NON_RETRYABLE_PATTERNS:
+        if pattern in error_str:
+            return True
+
+    # KeyboardInterrupt and SystemExit should not be retried
+    if error_type in ("KeyboardInterrupt", "SystemExit"):
+        return True
+
+    # Default: assume retryable (conservative — prefer retrying over failing)
+    return False

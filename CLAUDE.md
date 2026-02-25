@@ -231,7 +231,7 @@ Optimistic behavior:
 - Oracle views without PKs or unique indexes: columns sync, but PK warning is logged and CDC/SCD2 skip until IsPrimaryKey is set manually
 - PK discovery failure (connection error, permissions): columns still sync, PK warning logged, non-fatal
 
-**CDC + SCD2 in Polars** (feature flags USE_POLARS_CDC and USE_POLARS_SCD2 in orchestration/small_tables.py). The in-memory path carries df_current and pk_columns forward from CDC to SCD2, eliminating re-extraction from UDM_Stage.
+**CDC + SCD2 in Polars** — the in-memory path carries df_current and pk_columns forward from CDC to SCD2, eliminating re-extraction from UDM_Stage.
 
 **SCD2 is optimized from 5 steps to 2**: (1) single UPDATE batch for closes/deletes, (2) single INSERT batch for new rows + new versions. Unchanged rows are counted but NOT touched — saves GB of transaction log.
 
@@ -347,6 +347,7 @@ Questions these tables answer together:
 - **mssql-tools18**: Current minimum version is the installed default. When v18.6.1.1+ is available, upgrade to re-enable `-C 65001` for explicit UTF-8 codepage control (W-1).
 
 ## Gotchas
+- Item-22: `CSV_OUTPUT_DIR` is safe for concurrent `--workers` only because each table's extract→CDC→SCD2→cleanup pipeline is sequential within a single worker. `cleanup_csvs()` globs `{source}_{table}_*.csv` with a trailing underscore (P3-6) to prevent cross-table matches. Do NOT restructure the pipeline to allow overlapping steps within a worker without adding per-table subdirectories for CSV isolation.
 - B-1: _row_hash and UdmHash are VARCHAR(64) (full SHA-256 hex string). Previous BIGINT (64-bit truncation) was safe for per-PK CDC (~1.6×10⁻¹⁰ risk) but not for adjacent operations (reconciliation, future surrogate keys) where birthday-paradox collisions reach ~24% at 3B rows. Upgrade was defense-in-depth. Migration script: `migrations/b1_hash_varchar64.py`. First pipeline run after migration rehashes all rows (one-time CDC update wave).
 - B-2: SCD2 UPDATE batch size must stay below 5,000 to prevent SQL Server lock escalation from row locks to table-level exclusive locks. Table-level exclusive locks override RCSI, blocking all readers. Controlled by `config.SCD2_UPDATE_BATCH_SIZE` (default 4,000).
 - B-3: Schema evolution (column adds) changes all row hashes on the next run. `evolve_schema()` returns `SchemaEvolutionResult` so orchestrators can suppress E-12 false warnings during schema migration runs. Check `PipelineEventLog` metadata for `"schema_migration": true`.

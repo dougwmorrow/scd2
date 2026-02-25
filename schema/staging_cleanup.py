@@ -14,6 +14,7 @@ import logging
 
 import config
 import connections
+from connections import quote_table
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ def _cleanup_database(database: str) -> int:
             full_name = f"{database}.{schema}.{table_name}"
             try:
                 cursor = conn.cursor()
-                cursor.execute(f"DROP TABLE IF EXISTS {full_name}")
+                cursor.execute(f"DROP TABLE IF EXISTS {quote_table(full_name)}")
                 cursor.close()
                 logger.info("P3-3: Dropped orphaned staging table: %s", full_name)
                 dropped += 1

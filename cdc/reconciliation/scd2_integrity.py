@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 
+import config
 import connections
+from connections import cursor_for, quote_identifier, quote_table
 from extract.udm_connectorx_extractor import read_bronze_table, read_stage_table, table_exists
 
 from cdc.reconciliation.core import _RECON_MAX_ROWS
@@ -226,124 +228,126 @@ def validate_scd2_integrity(table_config: TableConfig) -> SCD2IntegrityResult:
         )
         return result
 
-    pk_join = " AND ".join(f"a.[{c}] = b.[{c}]" for c in pk_columns)
-    pk_group = ", ".join(f"[{c}]" for c in pk_columns)
-    pk_partition = ", ".join(f"[{c}]" for c in pk_columns)
+    # Item-13: Use quote_identifier/quote_table for all dynamic SQL (H-1).
+    q_bronze = quote_table(bronze_table)
+    pk_join = " AND ".join(
+        f"a.{quote_identifier(c)} = b.{quote_identifier(c)}" for c in pk_columns
+    )
+    pk_group = ", ".join(quote_identifier(c) for c in pk_columns)
+    pk_partition = ", ".join(quote_identifier(c) for c in pk_columns)
 
-    conn = connections.get_bronze_connection()
+    # Item-16: Migrated from manual conn/try/finally to cursor_for().
     try:
-        cursor = conn.cursor()
+        with cursor_for(config.BRONZE_DB) as cursor:
 
-        # --- Check 1: Overlapping intervals ---
-        # Two versions overlap if a.Effective < b.End AND b.Effective < a.End
-        # Use ISNULL(EndDateTime, '9999-12-31') for active rows (NULL EndDateTime).
-        overlap_sql = f"""
-            SELECT COUNT(*) FROM (
-                SELECT DISTINCT {pk_group}
-                FROM {bronze_table} a
-                INNER JOIN {bronze_table} b
-                    ON {pk_join}
-                    AND a._scd2_key <> b._scd2_key
-                    AND a.UdmEffectiveDateTime < ISNULL(b.UdmEndDateTime, '9999-12-31')
-                    AND b.UdmEffectiveDateTime < ISNULL(a.UdmEndDateTime, '9999-12-31')
-            ) AS overlap
-        """
-        cursor.execute(overlap_sql)
-        result.overlapping_intervals = cursor.fetchone()[0]
-
-        if result.overlapping_intervals > 0:
-            sample_sql = f"""
-                SELECT TOP 5 {pk_group}
-                FROM {bronze_table} a
-                INNER JOIN {bronze_table} b
-                    ON {pk_join}
-                    AND a._scd2_key <> b._scd2_key
-                    AND a.UdmEffectiveDateTime < ISNULL(b.UdmEndDateTime, '9999-12-31')
-                    AND b.UdmEffectiveDateTime < ISNULL(a.UdmEndDateTime, '9999-12-31')
-                GROUP BY {pk_group}
+            # --- Check 1: Overlapping intervals ---
+            # Two versions overlap if a.Effective < b.End AND b.Effective < a.End
+            # Use ISNULL(EndDateTime, '9999-12-31') for active rows (NULL EndDateTime).
+            overlap_sql = f"""
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT {pk_group}
+                    FROM {q_bronze} a
+                    INNER JOIN {q_bronze} b
+                        ON {pk_join}
+                        AND a._scd2_key <> b._scd2_key
+                        AND a.UdmEffectiveDateTime < ISNULL(b.UdmEndDateTime, '9999-12-31')
+                        AND b.UdmEffectiveDateTime < ISNULL(a.UdmEndDateTime, '9999-12-31')
+                ) AS overlap
             """
-            cursor.execute(sample_sql)
-            result.sample_overlapping_pks = [str(row) for row in cursor.fetchall()]
-            logger.error(
-                "V-3: %d PKs with overlapping SCD2 intervals in %s. Samples: %s",
-                result.overlapping_intervals, bronze_table, result.sample_overlapping_pks,
-            )
+            cursor.execute(overlap_sql)
+            result.overlapping_intervals = cursor.fetchone()[0]
 
-        # --- Check 2: Zero active PKs ---
-        # PKs where all versions are expired (no UdmActiveFlag=1 row).
-        zero_active_sql = f"""
-            SELECT COUNT(*) FROM (
-                SELECT {pk_group}
-                FROM {bronze_table}
-                GROUP BY {pk_group}
-                HAVING SUM(CASE WHEN UdmActiveFlag = 1 THEN 1 ELSE 0 END) = 0
-            ) AS zero_active
-        """
-        cursor.execute(zero_active_sql)
-        result.zero_active_pks = cursor.fetchone()[0]
+            if result.overlapping_intervals > 0:
+                sample_sql = f"""
+                    SELECT TOP 5 {pk_group}
+                    FROM {q_bronze} a
+                    INNER JOIN {q_bronze} b
+                        ON {pk_join}
+                        AND a._scd2_key <> b._scd2_key
+                        AND a.UdmEffectiveDateTime < ISNULL(b.UdmEndDateTime, '9999-12-31')
+                        AND b.UdmEffectiveDateTime < ISNULL(a.UdmEndDateTime, '9999-12-31')
+                    GROUP BY {pk_group}
+                """
+                cursor.execute(sample_sql)
+                result.sample_overlapping_pks = [str(row) for row in cursor.fetchall()]
+                logger.error(
+                    "V-3: %d PKs with overlapping SCD2 intervals in %s. Samples: %s",
+                    result.overlapping_intervals, bronze_table, result.sample_overlapping_pks,
+                )
 
-        if result.zero_active_pks > 0:
-            sample_sql = f"""
-                SELECT TOP 5 {pk_group}
-                FROM {bronze_table}
-                GROUP BY {pk_group}
-                HAVING SUM(CASE WHEN UdmActiveFlag = 1 THEN 1 ELSE 0 END) = 0
+            # --- Check 2: Zero active PKs ---
+            # PKs where all versions are expired (no UdmActiveFlag=1 row).
+            zero_active_sql = f"""
+                SELECT COUNT(*) FROM (
+                    SELECT {pk_group}
+                    FROM {q_bronze}
+                    GROUP BY {pk_group}
+                    HAVING SUM(CASE WHEN UdmActiveFlag = 1 THEN 1 ELSE 0 END) = 0
+                ) AS zero_active
             """
-            cursor.execute(sample_sql)
-            result.sample_zero_active_pks = [str(row) for row in cursor.fetchall()]
-            logger.error(
-                "V-3: %d PKs with zero active rows in %s. Samples: %s",
-                result.zero_active_pks, bronze_table, result.sample_zero_active_pks,
-            )
+            cursor.execute(zero_active_sql)
+            result.zero_active_pks = cursor.fetchone()[0]
 
-        # --- Check 3: Gaps between consecutive versions ---
-        # Use LAG(UdmEndDateTime) partitioned by PK, ordered by EffectiveDateTime.
-        # A gap exists when previous EndDateTime < current EffectiveDateTime
-        # with more than 1-second tolerance.
-        gap_sql = f"""
-            SELECT COUNT(*) FROM (
-                SELECT {pk_group}
-                FROM (
-                    SELECT {pk_group},
-                        UdmEffectiveDateTime,
-                        LAG(ISNULL(UdmEndDateTime, '9999-12-31'))
-                            OVER (PARTITION BY {pk_partition} ORDER BY UdmEffectiveDateTime)
-                            AS prev_end
-                    FROM {bronze_table}
-                ) versioned
-                WHERE prev_end IS NOT NULL
-                    AND prev_end < '9999-12-31'
-                    AND DATEDIFF(SECOND, prev_end, UdmEffectiveDateTime) > 1
-                GROUP BY {pk_group}
-            ) AS gaps
-        """
-        cursor.execute(gap_sql)
-        result.version_gaps = cursor.fetchone()[0]
+            if result.zero_active_pks > 0:
+                sample_sql = f"""
+                    SELECT TOP 5 {pk_group}
+                    FROM {q_bronze}
+                    GROUP BY {pk_group}
+                    HAVING SUM(CASE WHEN UdmActiveFlag = 1 THEN 1 ELSE 0 END) = 0
+                """
+                cursor.execute(sample_sql)
+                result.sample_zero_active_pks = [str(row) for row in cursor.fetchall()]
+                logger.error(
+                    "V-3: %d PKs with zero active rows in %s. Samples: %s",
+                    result.zero_active_pks, bronze_table, result.sample_zero_active_pks,
+                )
 
-        if result.version_gaps > 0:
-            sample_sql = f"""
-                SELECT TOP 5 {pk_group}
-                FROM (
-                    SELECT {pk_group},
-                        UdmEffectiveDateTime,
-                        LAG(ISNULL(UdmEndDateTime, '9999-12-31'))
-                            OVER (PARTITION BY {pk_partition} ORDER BY UdmEffectiveDateTime)
-                            AS prev_end
-                    FROM {bronze_table}
-                ) versioned
-                WHERE prev_end IS NOT NULL
-                    AND prev_end < '9999-12-31'
-                    AND DATEDIFF(SECOND, prev_end, UdmEffectiveDateTime) > 1
-                GROUP BY {pk_group}
+            # --- Check 3: Gaps between consecutive versions ---
+            # Use LAG(UdmEndDateTime) partitioned by PK, ordered by EffectiveDateTime.
+            # A gap exists when previous EndDateTime < current EffectiveDateTime
+            # with more than 1-second tolerance.
+            gap_sql = f"""
+                SELECT COUNT(*) FROM (
+                    SELECT {pk_group}
+                    FROM (
+                        SELECT {pk_group},
+                            UdmEffectiveDateTime,
+                            LAG(ISNULL(UdmEndDateTime, '9999-12-31'))
+                                OVER (PARTITION BY {pk_partition} ORDER BY UdmEffectiveDateTime)
+                                AS prev_end
+                        FROM {q_bronze}
+                    ) versioned
+                    WHERE prev_end IS NOT NULL
+                        AND prev_end < '9999-12-31'
+                        AND DATEDIFF(SECOND, prev_end, UdmEffectiveDateTime) > 1
+                    GROUP BY {pk_group}
+                ) AS gaps
             """
-            cursor.execute(sample_sql)
-            result.sample_gap_pks = [str(row) for row in cursor.fetchall()]
-            logger.error(
-                "V-3: %d PKs with version gaps in %s. Samples: %s",
-                result.version_gaps, bronze_table, result.sample_gap_pks,
-            )
+            cursor.execute(gap_sql)
+            result.version_gaps = cursor.fetchone()[0]
 
-        cursor.close()
+            if result.version_gaps > 0:
+                sample_sql = f"""
+                    SELECT TOP 5 {pk_group}
+                    FROM (
+                        SELECT {pk_group},
+                            UdmEffectiveDateTime,
+                            LAG(ISNULL(UdmEndDateTime, '9999-12-31'))
+                                OVER (PARTITION BY {pk_partition} ORDER BY UdmEffectiveDateTime)
+                                AS prev_end
+                        FROM {q_bronze}
+                    ) versioned
+                    WHERE prev_end IS NOT NULL
+                        AND prev_end < '9999-12-31'
+                        AND DATEDIFF(SECOND, prev_end, UdmEffectiveDateTime) > 1
+                    GROUP BY {pk_group}
+                """
+                cursor.execute(sample_sql)
+                result.sample_gap_pks = [str(row) for row in cursor.fetchall()]
+                logger.error(
+                    "V-3: %d PKs with version gaps in %s. Samples: %s",
+                    result.version_gaps, bronze_table, result.sample_gap_pks,
+                )
 
         # Log summary
         if result.is_clean:
@@ -364,7 +368,5 @@ def validate_scd2_integrity(table_config: TableConfig) -> SCD2IntegrityResult:
             "V-3: SCD2 integrity validation error for %s.%s",
             table_config.source_name, table_config.source_object_name,
         )
-    finally:
-        conn.close()
 
     return result

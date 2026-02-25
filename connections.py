@@ -1,11 +1,13 @@
 """SQL Server target database connections (UDM_Stage, UDM_Bronze, General).
 
 Provides both pyodbc connections (for DDL/DML) and ConnectorX URIs (for reads).
+Also provides identifier quoting helpers (H-1) for safe dynamic SQL construction.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import contextmanager
 from urllib.parse import quote_plus
 
@@ -14,6 +16,78 @@ import pyodbc
 import config
 
 logger = logging.getLogger(__name__)
+
+# P-3: Connection overhead measurement — tracks cumulative time spent
+# establishing pyodbc connections per pipeline run. Query via
+# get_connection_overhead() at pipeline end for observability.
+# NOTE: These counters are per-process and NOT thread-safe (Item-23).
+# Safe under the current multiprocessing worker model where each worker
+# is a separate process with its own module state.
+_connection_time_ms: float = 0.0
+_connection_count: int = 0
+
+# Item-18: Per-database connection pool — one long-lived connection per database.
+# Eliminates TCP/TLS/ODBC handshake overhead for repeated cursor_for() calls.
+# Safe because: autocommit=True prevents transaction state leaks, and the pipeline
+# uses multiprocessing (not threading) so each process has its own pool.
+# Lock-holding connections (table_lock.py) use _get_resilient_lock_connection()
+# and bypass this pool entirely.
+_connection_pool: dict[str, pyodbc.Connection] = {}
+
+# ---------------------------------------------------------------------------
+# H-1: SQL identifier escaping — bracket-escape with ]] doubling
+# ---------------------------------------------------------------------------
+
+_MAX_IDENTIFIER_LENGTH = 128  # SQL Server sysname limit (matches QUOTENAME())
+
+
+def quote_identifier(name: str) -> str:
+    """H-1: Bracket-escape a SQL Server identifier (column, index, constraint name).
+
+    Equivalent to T-SQL QUOTENAME(): wraps in brackets and doubles any embedded
+    closing brackets. Rejects identifiers longer than 128 characters to match
+    the sysname limit that QUOTENAME() enforces server-side.
+
+    Args:
+        name: Raw identifier (e.g. column name, index name).
+
+    Returns:
+        Bracket-escaped identifier (e.g. ``[my_column]``, ``[tricky]]name]``).
+
+    Raises:
+        ValueError: If name exceeds 128 characters or is empty.
+    """
+    if not name:
+        raise ValueError("H-1: Identifier cannot be empty")
+    if len(name) > _MAX_IDENTIFIER_LENGTH:
+        raise ValueError(
+            f"H-1: Identifier exceeds {_MAX_IDENTIFIER_LENGTH} characters "
+            f"(len={len(name)}): {name[:50]}..."
+        )
+    return f"[{name.replace(']', ']]')}]"
+
+
+def quote_table(full_table_name: str) -> str:
+    """H-1: Bracket-escape a fully qualified table name (db.schema.table).
+
+    Splits on '.' and bracket-escapes each part individually.
+
+    Args:
+        full_table_name: e.g. ``UDM_Stage.DNA.ACCT_cdc``
+
+    Returns:
+        e.g. ``[UDM_Stage].[DNA].[ACCT_cdc]``
+
+    Raises:
+        ValueError: If not exactly 3 parts, or any part exceeds 128 chars.
+    """
+    parts = full_table_name.split(".")
+    if len(parts) != 3:
+        raise ValueError(
+            f"H-1: Expected 3-part table name (db.schema.table), "
+            f"got {len(parts)} parts: {full_table_name}"
+        )
+    return ".".join(quote_identifier(p) for p in parts)
 
 
 def _pyodbc_connection_string(database: str) -> str:
@@ -39,19 +113,46 @@ def _connectorx_uri(database: str) -> str:
 # --- pyodbc Connections ---
 
 def get_stage_connection() -> pyodbc.Connection:
-    return pyodbc.connect(_pyodbc_connection_string(config.STAGE_DB), autocommit=True)
+    return get_connection(config.STAGE_DB)
 
 
 def get_bronze_connection() -> pyodbc.Connection:
-    return pyodbc.connect(_pyodbc_connection_string(config.BRONZE_DB), autocommit=True)
+    return get_connection(config.BRONZE_DB)
 
 
 def get_general_connection() -> pyodbc.Connection:
-    return pyodbc.connect(_pyodbc_connection_string(config.GENERAL_DB), autocommit=True)
+    return get_connection(config.GENERAL_DB)
 
 
 def get_connection(database: str) -> pyodbc.Connection:
-    return pyodbc.connect(_pyodbc_connection_string(database), autocommit=True)
+    """Create a fresh pyodbc connection (not pooled).
+
+    Item-23: The overhead counters (_connection_time_ms, _connection_count) are
+    per-process globals incremented without locking. Safe under the current
+    multiprocessing worker model; would race under threading.
+    """
+    global _connection_time_ms, _connection_count
+    start = time.monotonic()
+    conn = pyodbc.connect(_pyodbc_connection_string(database), autocommit=True)
+    elapsed = (time.monotonic() - start) * 1000
+    _connection_time_ms += elapsed
+    _connection_count += 1
+    return conn
+
+
+def get_connection_overhead() -> tuple[float, int]:
+    """P-3: Return cumulative connection overhead (total_ms, connection_count).
+
+    Call at pipeline end to log total time spent establishing DB connections.
+    """
+    return _connection_time_ms, _connection_count
+
+
+def reset_connection_overhead() -> None:
+    """P-3: Reset connection overhead counters (e.g. at pipeline start)."""
+    global _connection_time_ms, _connection_count
+    _connection_time_ms = 0.0
+    _connection_count = 0
 
 
 # --- ConnectorX URIs ---
@@ -74,8 +175,10 @@ def general_connectorx_uri() -> str:
 def cursor_for(database: str):
     """X-1: Context manager yielding a cursor for the given database.
 
-    Replaces the verbose ``conn = get_connection(); try: ... finally: conn.close()``
-    pattern with a concise ``with cursor_for(db) as cur:`` block.
+    Item-18: Uses a per-database connection pool to avoid repeated TCP/TLS/ODBC
+    handshake overhead. The connection stays in the pool after the cursor is closed.
+    On pyodbc.OperationalError (connection dropped, server restart), the stale
+    connection is evicted and the error propagates to the caller.
 
     Usage::
 
@@ -83,13 +186,40 @@ def cursor_for(database: str):
             cur.execute("SELECT 1")
             row = cur.fetchone()
     """
-    conn = get_connection(database)
+    conn = _connection_pool.get(database)
+    if conn is None:
+        conn = get_connection(database)
+        _connection_pool[database] = conn
+
+    cursor = conn.cursor()
     try:
-        cursor = conn.cursor()
         yield cursor
-        cursor.close()
+    except pyodbc.OperationalError:
+        # Connection-level failure — evict stale connection from pool.
+        _connection_pool.pop(database, None)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
     finally:
-        conn.close()
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
+def close_connection_pool() -> None:
+    """Item-18: Close all pooled connections. Call at pipeline shutdown."""
+    count = len(_connection_pool)
+    for db in list(_connection_pool):
+        try:
+            _connection_pool[db].close()
+        except Exception:
+            pass
+    _connection_pool.clear()
+    if count > 0:
+        logger.debug("Item-18: Connection pool closed (%d connections)", count)
 
 
 # --- Startup Validation ---

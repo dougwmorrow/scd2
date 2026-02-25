@@ -9,6 +9,7 @@ import logging
 from typing import TYPE_CHECKING
 
 import connections
+from connections import quote_identifier, quote_table
 
 if TYPE_CHECKING:
     from orchestration.table_config import ColumnConfig
@@ -40,7 +41,7 @@ def disable_indexes(full_table_name: str, index_configs: list[ColumnConfig]) -> 
                 continue
             try:
                 cursor.execute(
-                    f"ALTER INDEX [{col_cfg.index_name}] ON {full_table_name} DISABLE"
+                    f"ALTER INDEX {quote_identifier(col_cfg.index_name)} ON {quote_table(full_table_name)} DISABLE"
                 )
                 disabled.append(col_cfg.index_name)
                 logger.info(
@@ -78,7 +79,7 @@ def rebuild_indexes(full_table_name: str, index_names: list[str]) -> None:
         for idx_name in index_names:
             try:
                 cursor.execute(
-                    f"ALTER INDEX [{idx_name}] ON {full_table_name} REBUILD"
+                    f"ALTER INDEX {quote_identifier(idx_name)} ON {quote_table(full_table_name)} REBUILD"
                 )
                 logger.info(
                     "Rebuilt index %s on %s", idx_name, full_table_name
