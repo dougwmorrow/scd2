@@ -54,6 +54,9 @@ class TableConfig:
     lookback_days: int | None = None
     stage_load_tool: str | None = None
     columns: list[ColumnConfig] = field(default_factory=list)
+    # Resolved schema casing from sys.schemas — set by _build_configs()
+    _resolved_stage_schema: str | None = None
+    _resolved_bronze_schema: str | None = None
 
     @property
     def effective_stage_name(self) -> str:
@@ -64,12 +67,20 @@ class TableConfig:
         return self.bronze_table_name or self.source_object_name
 
     @property
+    def stage_schema(self) -> str:
+        return self._resolved_stage_schema or self.source_name
+
+    @property
+    def bronze_schema(self) -> str:
+        return self._resolved_bronze_schema or self.source_name
+
+    @property
     def stage_full_table_name(self) -> str:
-        return f"{config.STAGE_DB}.{self.source_name}.{self.effective_stage_name}_cdc"
+        return f"{config.STAGE_DB}.{self.stage_schema}.{self.effective_stage_name}_cdc"
 
     @property
     def bronze_full_table_name(self) -> str:
-        return f"{config.BRONZE_DB}.{self.source_name}.{self.effective_bronze_name}_scd2_python"
+        return f"{config.BRONZE_DB}.{self.bronze_schema}.{self.effective_bronze_name}_scd2_python"
 
     @property
     def source_full_table_name(self) -> str:
@@ -167,7 +178,25 @@ class TableConfigLoader:
         )
         return cx.read_sql(self._uri, query, return_type="polars")
 
+    def _resolve_schemas(self, source_names: set[str]) -> dict[tuple[str, str], str]:
+        """Resolve actual schema casing for each (database, source_name) pair.
+
+        Caches results so we only query sys.schemas once per unique pair
+        (typically 2 queries total: one for Stage DB, one for Bronze DB).
+        """
+        resolved: dict[tuple[str, str], str] = {}
+        for source_name in source_names:
+            for database in (config.STAGE_DB, config.BRONZE_DB):
+                key = (database, source_name)
+                if key not in resolved:
+                    resolved[key] = connections.resolve_schema_name(database, source_name)
+        return resolved
+
     def _build_configs(self, tables_df: pl.DataFrame, columns_df: pl.DataFrame) -> list[TableConfig]:
+        # Resolve schema casing once per unique source_name
+        unique_sources = set(tables_df["SourceName"].to_list())
+        schema_map = self._resolve_schemas(unique_sources)
+
         configs = []
         for row in tables_df.iter_rows(named=True):
             tc = TableConfig(
@@ -186,6 +215,10 @@ class TableConfigLoader:
                 lookback_days=int(row["LookbackDays"]) if row.get("LookbackDays") else None,
                 stage_load_tool=row.get("StageLoadTool"),
             )
+
+            # Set resolved schema casing from sys.schemas
+            tc._resolved_stage_schema = schema_map.get((config.STAGE_DB, tc.source_name))
+            tc._resolved_bronze_schema = schema_map.get((config.BRONZE_DB, tc.source_name))
 
             table_name = tc.effective_stage_name
             source_name = tc.source_name

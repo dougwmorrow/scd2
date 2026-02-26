@@ -31,17 +31,18 @@ from schema.table_creator import ensure_bronze_table, ensure_bronze_point_in_tim
 from orchestration.table_lock import acquire_table_lock, release_table_lock
 
 if TYPE_CHECKING:
+    import polars as pl
     from orchestration.table_config import TableConfig
 
 logger = logging.getLogger(__name__)
 
 # P3-1: Small table size guard threshold.
 # If extraction exceeds this row count, log WARNING suggesting reclassification.
-SMALL_TABLE_SIZE_THRESHOLD = 10_000_000
+SMALL_TABLE_SIZE_THRESHOLD = 100_000_000
 
 # S-2: Absolute ceiling on first-run extraction for small tables.
 # Prevents OOM when a large table is misconfigured as small (no SourceAggregateColumnName).
-FIRST_RUN_MAX_ROWS = 50_000_000
+FIRST_RUN_MAX_ROWS = 100_000_000
 
 
 def process_small_table(

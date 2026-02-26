@@ -90,6 +90,39 @@ def quote_table(full_table_name: str) -> str:
     return ".".join(quote_identifier(p) for p in parts)
 
 
+def resolve_schema_name(database: str, schema_name: str) -> str:
+    """Resolve actual schema casing from sys.schemas.
+
+    SQL Server schema names are case-insensitive for queries but BCP uses
+    the exact casing provided. If the target database has schema 'dna' but
+    SourceName is 'DNA', BCP hangs on the mismatched/ambiguous schema.
+
+    Returns the actual stored casing if the schema exists, or the input
+    as-is if no match is found (first run — table_creator.py will create it).
+    """
+    try:
+        with cursor_for(database) as cur:
+            cur.execute(
+                "SELECT name FROM sys.schemas WHERE LOWER(name) = LOWER(?)",
+                schema_name,
+            )
+            row = cur.fetchone()
+            if row is not None:
+                resolved = row[0]
+                if resolved != schema_name:
+                    logger.info(
+                        "Schema casing resolved: %s.%s -> %s.%s",
+                        database, schema_name, database, resolved,
+                    )
+                return resolved
+    except Exception:
+        logger.warning(
+            "Could not resolve schema casing for %s.%s — using as-is",
+            database, schema_name, exc_info=True,
+        )
+    return schema_name
+
+
 def _pyodbc_connection_string(database: str) -> str:
     return (
         f"DRIVER={{{config.ODBC_DRIVER}}};"

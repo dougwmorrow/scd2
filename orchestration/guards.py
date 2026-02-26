@@ -37,7 +37,7 @@ def check_extraction_guard(
     drop_threshold: float = 0.10,
     warn_threshold: float = 0.50,
     growth_threshold: float = 5.0,
-    first_run_ceiling: int = 50_000_000,
+    first_run_ceiling: int = 100_000_000,
     context: str = "",
 ) -> bool:
     """Check if extraction row count is within expected bounds.

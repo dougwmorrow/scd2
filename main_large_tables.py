@@ -49,6 +49,8 @@ def _process_table_worker(table_config_dict: dict) -> tuple[str, str, bool]:
         columns=[
             ColumnConfig(**col) for col in table_config_dict.get("columns", [])
         ],
+        _resolved_stage_schema=table_config_dict.get("_resolved_stage_schema"),
+        _resolved_bronze_schema=table_config_dict.get("_resolved_bronze_schema"),
     )
 
     tracker = PipelineEventTracker()

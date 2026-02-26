@@ -215,6 +215,8 @@ def table_config_to_dict(tc, batch_id: int) -> dict:
         "first_load_date": tc.first_load_date,
         "lookback_days": tc.lookback_days,
         "stage_load_tool": tc.stage_load_tool,
+        "_resolved_stage_schema": tc._resolved_stage_schema,
+        "_resolved_bronze_schema": tc._resolved_bronze_schema,
         "columns": [
             {
                 "source_name": c.source_name,
