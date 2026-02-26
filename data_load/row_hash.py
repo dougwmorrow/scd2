@@ -99,7 +99,7 @@ def _normalize_for_hashing(
                 expr = pl.when(expr == "").then(None).otherwise(expr)
             # N-1: NFC normalization (Rust-native, SIMD).
             # E-4: RTRIM trailing spaces for hash stability.
-            expr = expr.str.normalize("NFC").str.rstrip(" ")
+            expr = expr.str.normalize("NFC").str.strip_chars_end(" ")
             exprs.append(expr.alias(c))
         df = df.with_columns(exprs)
         if source_is_oracle:

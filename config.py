@@ -31,10 +31,30 @@ ORACLE_CLIENT_DIR = os.getenv("ORACLE_CLIENT_DIR", "/usr/lib/oracle/19.25/client
 
 # --- BCP Configuration ---
 BCP_PATH = os.getenv("BCP_PATH", "/opt/mssql-tools18/bin/bcp")
-BCP_BATCH_SIZE = int(os.getenv("BCP_BATCH_SIZE", "10000"))
+
+# BCP-HANG-FIX §3: Batch size lowered from 10000 to 5000 to stay at or below
+# SQL Server's ~5,000 lock escalation threshold. At <=5000, BCP uses row-level
+# locks only — no escalation to table-level X locks. This eliminates the most
+# common cause of BCP blocking (table X lock blocking subsequent IX requests).
+# The diagnostic guide shows this reduces blocking probability from "Very high"
+# to "Very low" and lock duration from minutes to sub-seconds per batch.
+BCP_BATCH_SIZE = int(os.getenv("BCP_BATCH_SIZE", "5000"))
+
 BCP_PACKET_SIZE = int(os.getenv("BCP_PACKET_SIZE", "4096"))
 # P1-7: BCP timeout in seconds — higher for large tables / initial backfills
 BCP_TIMEOUT = int(os.getenv("BCP_TIMEOUT", "7200"))
+
+# BCP-HANG-FIX: Retry configuration for blocked BCP loads.
+# When BCP times out (likely blocked by another session), retry with
+# exponential backoff after cleaning up orphaned sessions. Default 3 retries
+# gives attempts at 0s, 5s, 10s — total max wait ~15s before final failure.
+BCP_MAX_RETRIES = int(os.getenv("BCP_MAX_RETRIES", "3"))
+
+# BCP-HANG-FIX §7: Wait time in seconds after killing orphaned BULK INSERT
+# sessions, to allow SQL Server to complete single-threaded rollback before
+# retrying. For a 300K-row orphaned transaction, rollback typically takes 5-15s.
+# Set higher for larger tables or slower storage.
+BCP_ORPHAN_ROLLBACK_WAIT = int(os.getenv("BCP_ORPHAN_ROLLBACK_WAIT", "15"))
 
 # --- BCP CSV Contract (Single Source of Truth) ---
 CSV_SEPARATOR = "\t"

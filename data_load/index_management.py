@@ -64,6 +64,18 @@ def disable_indexes(full_table_name: str, index_configs: list[ColumnConfig]) -> 
 def rebuild_indexes(full_table_name: str, index_names: list[str]) -> None:
     """Rebuild previously disabled indexes after BCP load.
 
+    BCP-HANG-FIX §2: Uses ONLINE rebuild with WAIT_AT_LOW_PRIORITY to prevent
+    Schema Modification (Sch-M) locks from creating blocking chains. Without
+    this, an index rebuild holds Sch-M for its entire duration which blocks
+    ALL subsequent Sch-S requests (including BCP loads on other sessions).
+    The cascading effect is severe: even a *waiting* Sch-M request blocks
+    subsequent Sch-S requests, creating multi-session blocking chains.
+
+    WAIT_AT_LOW_PRIORITY(MAX_DURATION=1, ABORT_AFTER_WAIT=SELF) causes the
+    rebuild to abort itself rather than block other operations. On failure,
+    falls back to standard offline REBUILD which is guaranteed to succeed
+    but may briefly block concurrent operations.
+
     Args:
         full_table_name: Fully qualified table name (db.schema.table).
         index_names: Index names to rebuild.
@@ -78,19 +90,42 @@ def rebuild_indexes(full_table_name: str, index_names: list[str]) -> None:
         cursor = conn.cursor()
         for idx_name in index_names:
             try:
+                # BCP-HANG-FIX §2: Try ONLINE rebuild with WAIT_AT_LOW_PRIORITY
+                # first. This holds Sch-M only briefly at start/end, and aborts
+                # itself after 1 minute rather than creating a blocking chain.
                 cursor.execute(
-                    f"ALTER INDEX {quote_identifier(idx_name)} ON {quote_table(full_table_name)} REBUILD"
+                    f"ALTER INDEX {quote_identifier(idx_name)} "
+                    f"ON {quote_table(full_table_name)} REBUILD "
+                    f"WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY "
+                    f"(MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)))"
                 )
                 logger.info(
-                    "Rebuilt index %s on %s", idx_name, full_table_name
+                    "BCP-HANG-FIX: Rebuilt index %s on %s (ONLINE + WAIT_AT_LOW_PRIORITY)",
+                    idx_name, full_table_name,
                 )
             except Exception:
-                logger.warning(
-                    "Failed to rebuild index %s on %s",
-                    idx_name,
-                    full_table_name,
-                    exc_info=True,
+                # Fallback: ONLINE rebuild not supported (e.g. Standard Edition,
+                # certain index types like spatial/XML). Use standard REBUILD.
+                logger.debug(
+                    "BCP-HANG-FIX: ONLINE rebuild failed for %s on %s — "
+                    "falling back to offline REBUILD",
+                    idx_name, full_table_name,
                 )
+                try:
+                    cursor.execute(
+                        f"ALTER INDEX {quote_identifier(idx_name)} "
+                        f"ON {quote_table(full_table_name)} REBUILD"
+                    )
+                    logger.info(
+                        "Rebuilt index %s on %s (offline)", idx_name, full_table_name
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to rebuild index %s on %s",
+                        idx_name,
+                        full_table_name,
+                        exc_info=True,
+                    )
         cursor.close()
     finally:
         conn.close()

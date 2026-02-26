@@ -69,6 +69,7 @@ class PipelineEventTracker:
         try:
             cursor = conn.cursor()
             cursor.execute(
+                "SET NOCOUNT ON; "
                 "INSERT INTO ops.PipelineBatchSequence DEFAULT VALUES; "
                 "SELECT SCOPE_IDENTITY();"
             )
