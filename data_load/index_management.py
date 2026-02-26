@@ -90,9 +90,9 @@ def rebuild_indexes(full_table_name: str, index_names: list[str]) -> None:
         cursor = conn.cursor()
         for idx_name in index_names:
             try:
-                # BCP-HANG-FIX §2: Try ONLINE rebuild with WAIT_AT_LOW_PRIORITY
-                # first. This holds Sch-M only briefly at start/end, and aborts
-                # itself after 1 minute rather than creating a blocking chain.
+                # §2: Try ONLINE rebuild with WAIT_AT_LOW_PRIORITY first.
+                # Holds Sch-M only briefly at start/end, and aborts itself
+                # after 1 minute rather than creating a blocking chain.
                 cursor.execute(
                     f"ALTER INDEX {quote_identifier(idx_name)} "
                     f"ON {quote_table(full_table_name)} REBUILD "
@@ -100,12 +100,13 @@ def rebuild_indexes(full_table_name: str, index_names: list[str]) -> None:
                     f"(MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)))"
                 )
                 logger.info(
-                    "BCP-HANG-FIX: Rebuilt index %s on %s (ONLINE + WAIT_AT_LOW_PRIORITY)",
+                    "BCP-HANG-FIX: Rebuilt index %s on %s "
+                    "(ONLINE + WAIT_AT_LOW_PRIORITY)",
                     idx_name, full_table_name,
                 )
             except Exception:
-                # Fallback: ONLINE rebuild not supported (e.g. Standard Edition,
-                # certain index types like spatial/XML). Use standard REBUILD.
+                # Fallback: ONLINE rebuild not supported (Standard Edition,
+                # spatial/XML indexes, etc). Use standard offline REBUILD.
                 logger.debug(
                     "BCP-HANG-FIX: ONLINE rebuild failed for %s on %s — "
                     "falling back to offline REBUILD",
@@ -117,7 +118,8 @@ def rebuild_indexes(full_table_name: str, index_names: list[str]) -> None:
                         f"ON {quote_table(full_table_name)} REBUILD"
                     )
                     logger.info(
-                        "Rebuilt index %s on %s (offline)", idx_name, full_table_name
+                        "Rebuilt index %s on %s (offline)",
+                        idx_name, full_table_name,
                     )
                 except Exception:
                     logger.warning(

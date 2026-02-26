@@ -36,8 +36,6 @@ BCP_PATH = os.getenv("BCP_PATH", "/opt/mssql-tools18/bin/bcp")
 # SQL Server's ~5,000 lock escalation threshold. At <=5000, BCP uses row-level
 # locks only — no escalation to table-level X locks. This eliminates the most
 # common cause of BCP blocking (table X lock blocking subsequent IX requests).
-# The diagnostic guide shows this reduces blocking probability from "Very high"
-# to "Very low" and lock duration from minutes to sub-seconds per batch.
 BCP_BATCH_SIZE = int(os.getenv("BCP_BATCH_SIZE", "5000"))
 
 BCP_PACKET_SIZE = int(os.getenv("BCP_PACKET_SIZE", "4096"))
@@ -53,8 +51,23 @@ BCP_MAX_RETRIES = int(os.getenv("BCP_MAX_RETRIES", "3"))
 # BCP-HANG-FIX §7: Wait time in seconds after killing orphaned BULK INSERT
 # sessions, to allow SQL Server to complete single-threaded rollback before
 # retrying. For a 300K-row orphaned transaction, rollback typically takes 5-15s.
-# Set higher for larger tables or slower storage.
 BCP_ORPHAN_ROLLBACK_WAIT = int(os.getenv("BCP_ORPHAN_ROLLBACK_WAIT", "15"))
+
+# --- BCP Live Monitor Configuration ---
+# BCP-HANG-FIX-v2: Background monitor thread polls SQL Server DMVs while BCP
+# runs. These settings control how aggressively the monitor detects hangs.
+
+# How often (seconds) the monitor queries SQL Server for diagnostics.
+# Lower = more granular timeline but more load on SQL Server.
+# 15s is a good balance: captures hang causes within 15s of onset.
+BCP_MONITOR_INTERVAL = int(os.getenv("BCP_MONITOR_INTERVAL", "15"))
+
+# How long (seconds) a definitive hang signal (e.g. LCK_M_IX wait, log full)
+# must persist before the monitor triggers early abort. This is ALSO the
+# initial grace period — no hang evaluation occurs before this many seconds.
+# 120s is enough for BCP to establish connection and start inserting, while
+# still catching hangs ~30x faster than waiting the full 7200s BCP_TIMEOUT.
+BCP_HANG_ABORT_THRESHOLD = int(os.getenv("BCP_HANG_ABORT_THRESHOLD", "120"))
 
 # --- BCP CSV Contract (Single Source of Truth) ---
 CSV_SEPARATOR = "\t"
