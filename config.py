@@ -32,13 +32,57 @@ ORACLE_CLIENT_DIR = os.getenv("ORACLE_CLIENT_DIR", "/usr/lib/oracle/19.25/client
 # --- BCP Configuration ---
 BCP_PATH = os.getenv("BCP_PATH", "/opt/mssql-tools18/bin/bcp")
 
-# BCP-HANG-FIX §3: Batch size lowered from 10000 to 5000 to stay at or below
-# SQL Server's ~5,000 lock escalation threshold. At <=5000, BCP uses row-level
-# locks only — no escalation to table-level X locks. This eliminates the most
-# common cause of BCP blocking (table X lock blocking subsequent IX requests).
+# ---------------------------------------------------------------------------
+# BCP throughput-optimized batch sizes (per table type)
+# ---------------------------------------------------------------------------
+# Stage tables (heaps, TABLOCK via sp_tableoption):
+#   With BU locks, no row/page-level locks exist — no escalation concern.
+#   Each batch commit triggers a log flush; fewer larger batches = fewer flushes.
+#   100K–500K optimal. If chunks are ~256 MB, omitting -b entirely works too.
+BCP_STAGE_BATCH_SIZE = int(os.getenv("BCP_STAGE_BATCH_SIZE", "100000"))
+#
+# Bronze tables (clustered index, no TABLOCK, concurrent readers required):
+#   Without TABLOCK, BCP uses row-level locks. Lock escalation is checked at
+#   ~2,500 acquisitions and attempted at ~5,000 per HoBt. Staying at 800
+#   prevents escalation to table-level X locks that block concurrent readers.
+BCP_BRONZE_BATCH_SIZE = int(os.getenv("BCP_BRONZE_BATCH_SIZE", "800"))
+#
+# Legacy fallback — used when caller doesn't specify stage vs bronze.
 BCP_BATCH_SIZE = int(os.getenv("BCP_BATCH_SIZE", "5000"))
 
-BCP_PACKET_SIZE = int(os.getenv("BCP_PACKET_SIZE", "4096"))
+# TDS packet size: -a flag, fully supported on Linux.
+# Default 4096 is dramatically undersized for bulk ops. 32768 (32 KB) matches
+# SQL Server's extent write size and benchmarks show 10–20% throughput gain.
+# Going to 65535 provides diminishing returns and may negotiate down anyway.
+BCP_PACKET_SIZE = int(os.getenv("BCP_PACKET_SIZE", "32768"))
+
+# ---------------------------------------------------------------------------
+# Parallel BCP streams (Stage heaps only)
+# ---------------------------------------------------------------------------
+# A single BCP stream typically achieves 100K–300K rows/sec. Parallel streams
+# with sp_tableoption TABLOCK (BU locks are compatible) multiply throughput.
+# 8 streams is a good starting point for Stage heaps with 10G networking.
+# Bronze tables should NOT use parallel streams with TABLOCK (exclusive lock).
+BCP_PARALLEL_STREAMS = int(os.getenv("BCP_PARALLEL_STREAMS", "8"))
+
+# Minimum rows to trigger parallel BCP. Below this, single stream is fine.
+BCP_PARALLEL_THRESHOLD = int(os.getenv("BCP_PARALLEL_THRESHOLD", "1000000"))
+
+# ---------------------------------------------------------------------------
+# Small table routing: pyodbc fast_executemany for tiny tables
+# ---------------------------------------------------------------------------
+# BCP subprocess startup costs ~1–2s (spawn, TDS handshake, lock acquisition).
+# For tables < threshold, pyodbc fast_executemany completes in milliseconds.
+BCP_SMALL_TABLE_THRESHOLD = int(os.getenv("BCP_SMALL_TABLE_THRESHOLD", "1000"))
+
+# ---------------------------------------------------------------------------
+# tmpfs for BCP CSV staging
+# ---------------------------------------------------------------------------
+# Writing CSVs to /dev/shm (tmpfs) eliminates source-side disk I/O.
+# Reads/writes at memory bandwidth (~10–50 GB/s) vs NVMe (~3–7 GB/s).
+# Falls back to CSV_OUTPUT_DIR if /dev/shm is unavailable or too small.
+CSV_TMPFS_DIR = Path(os.getenv("CSV_TMPFS_DIR", "/dev/shm/udm_bcp"))
+CSV_TMPFS_ENABLED = os.getenv("CSV_TMPFS_ENABLED", "true").lower() == "true"
 # P1-7: BCP timeout in seconds — higher for large tables / initial backfills
 BCP_TIMEOUT = int(os.getenv("BCP_TIMEOUT", "7200"))
 

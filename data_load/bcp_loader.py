@@ -31,20 +31,30 @@ BCP-HANG-FIX-v2 — Live diagnostic monitoring during BCP execution:
   which is NOT thread-safe per Item-23). If the monitor connection fails,
   BCP continues — monitoring is best-effort.
 
-B-2 KNOWN LIMITATION — Minimal logging on non-empty clustered-index tables:
-  For tables with a clustered index (all Bronze SCD2 tables), BCP is fully logged
-  on data pages when the table is non-empty. BULK_LOGGED mode only helps minimize
-  logging for index page operations. At 3M rows × ~200 bytes with log overhead,
-  expect 1.2–3 GB of transaction log per Bronze load. Ensure frequent transaction
-  log backups (every 15–30 minutes during loads) under FULL recovery model.
-  Monitor with: SELECT * FROM sys.dm_db_log_space_usage
+B-2 MINIMAL LOGGING — FastLoadContext on non-empty clustered-index tables:
+  For tables with a clustered index (all Bronze SCD2 tables), SQL Server 2019's
+  FastLoadContext (default since 2016, replaces TF 610) minimally logs rows
+  written to NEWLY ALLOCATED pages. Rows inserted into existing pages or pages
+  that split are fully logged. For billion-row Bronze tables (millions of pages),
+  the vast majority of inserts land on new pages and ARE minimally logged.
+  The ORDER hint (pre-sorting CSV by clustered key) maximizes FastLoadContext
+  coverage by reducing page splits. Monitor log usage during loads:
+  SELECT * FROM sys.dm_db_log_space_usage
 
-B-3 NOTE — TABLOCK not used (concurrent access allowed):
-  This BCP wrapper does NOT use the -h TABLOCK hint. Without TABLOCK, BCP uses
-  row/page-level locks, allowing concurrent reads from downstream consumers and
-  reporting queries during loads. The tradeoff: fully logged inserts even on heaps
-  (no minimal logging benefit from TABLOCK). Since Bronze tables have clustered
-  indexes (B-2), TABLOCK wouldn't help with minimal logging anyway.
+B-3 NOTE — TABLOCK strategy differs by table type:
+  STAGE tables (heaps, truncated before load): sp_tableoption 'table lock on
+  bulk load' is enabled before BCP and disabled after. This acquires Bulk Update
+  (BU) locks instead of row locks. BU locks are compatible with other BU locks,
+  enabling parallel BCP streams + minimal logging on heaps. The -h TABLOCK hint
+  is NOT supported on Linux BCP (mssql-tools18), so sp_tableoption is the
+  server-side workaround.
+
+  BRONZE tables (clustered index, concurrent readers required): TABLOCK on a
+  clustered index table takes an EXCLUSIVE lock (not BU), which blocks all
+  parallel bulk imports AND all readers. Bronze tables use NO TABLOCK, relying
+  on FastLoadContext for partial minimal logging on newly allocated pages.
+  LOCK_ESCALATION = DISABLE is set during the load window to prevent row locks
+  from escalating to table-level exclusive locks that would block readers.
 
 SCD-4 NOTE — cursor.rowcount reliability:
   All UPDATE operations in the pipeline use cursor.execute() (single statement),
@@ -73,12 +83,15 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyodbc
 
@@ -1001,12 +1014,21 @@ def bcp_load(
     expected_row_count: int | None = None,
     format_file: str | None = None,
     atomic: bool = True,
+    *,
+    is_stage: bool = False,
 ) -> int:
     """Load a BCP CSV file into SQL Server.
 
     BCP-HANG-FIX-v2: Includes live background diagnostic monitoring, pre-BCP
     orphan cleanup, SIGTERM-first termination, early abort on definitive hang
     detection, and retry with exponential backoff.
+
+    Throughput optimizations:
+      - TDS packet size: -a 32768 (10–20% throughput gain)
+      - Stage tables: BCP_STAGE_BATCH_SIZE (100K), sp_tableoption TABLOCK
+        via bulk_load_stage_context(), parallel streams for large loads
+      - Bronze tables: BCP_BRONZE_BATCH_SIZE (800), LOCK_ESCALATION=DISABLE
+        via bulk_load_bronze_context()
 
     Args:
         csv_path: Path to the CSV file (must follow BCP CSV Contract).
@@ -1015,6 +1037,8 @@ def bcp_load(
         format_file: W-13: Optional path to a BCP XML format file (.fmt).
         atomic: E-3: If True (default), omit -b flag for SCD2 atomicity.
                 If False, use -b batch_size (safe for Stage CDC loads).
+        is_stage: If True, use Stage-optimized batch size (100K).
+                  If False (default), use Bronze-safe batch size (800).
 
     Returns:
         Number of rows copied.
@@ -1023,7 +1047,7 @@ def bcp_load(
         BCPLoadError: On subprocess failure or row count mismatch.
         BCPBlockedError: If BCP is blocked and all retries exhausted.
     """
-    cmd = _build_bcp_command(csv_path, full_table_name, format_file, atomic)
+    cmd = _build_bcp_command(csv_path, full_table_name, format_file, atomic, is_stage=is_stage)
     bcp_env = _build_bcp_env()
 
     last_error: Exception | None = None
@@ -1111,11 +1135,16 @@ def _build_bcp_command(
     full_table_name: str,
     format_file: str | None,
     atomic: bool,
+    *,
+    is_stage: bool = False,
 ) -> list[str]:
     """Build the BCP command line arguments.
 
     §6: Includes -Yo (TrustServerCertificate) for ODBC Driver 18.
-    §3: BCP_BATCH_SIZE default lowered to 5000 to stay below lock escalation.
+    §3: Batch size differentiated by table type:
+        - Stage heaps (TABLOCK via sp_tableoption): 100K+ (no lock escalation concern)
+        - Bronze clustered (no TABLOCK): 800 (stay below lock escalation)
+    TDS: -a 32768 for 32 KB TDS packet size (10–20% throughput gain).
     """
     cmd = [
         config.BCP_PATH,
@@ -1130,12 +1159,19 @@ def _build_bcp_command(
         "-U", config.SQL_SERVER_USER,
         # §6: TrustServerCertificate for ODBC Driver 18.
         "-Yo",
+        # TDS packet size: 32 KB (fully supported on Linux).
+        # Default 4096 is dramatically undersized for bulk operations.
+        "-a", str(config.BCP_PACKET_SIZE),
     ]
 
     # E-3: Only batch when NOT atomic.
-    # §3: BCP_BATCH_SIZE = 5000 stays below lock escalation threshold.
+    # Batch size differentiated by table type per throughput guide.
     if not atomic:
-        cmd.extend(["-b", str(config.BCP_BATCH_SIZE)])
+        if is_stage:
+            batch_size = config.BCP_STAGE_BATCH_SIZE  # 100K — heaps with TABLOCK
+        else:
+            batch_size = config.BCP_BRONZE_BATCH_SIZE  # 800 — below lock escalation
+        cmd.extend(["-b", str(batch_size)])
 
     if format_file:
         cmd.extend(["-f", format_file])
@@ -1285,3 +1321,484 @@ def bulk_load_recovery_context(database: str):
             logger.exception("Failed to restore recovery model for %s", database)
         finally:
             conn.close()
+
+
+# ==========================================================================
+# Stage TABLOCK via sp_tableoption (Linux BCP -h hints workaround)
+# ==========================================================================
+
+@contextmanager
+def bulk_load_stage_context(database: str, full_table_name: str):
+    """Combined context: BULK_LOGGED + sp_tableoption 'table lock on bulk load'.
+
+    The -h hints flag (TABLOCK, ORDER, ROWS_PER_BATCH) is NOT supported on
+    Linux BCP (mssql-tools18). sp_tableoption is the server-side workaround
+    that achieves the same effect:
+      - Triggers Bulk Update (BU) lock acquisition for bulk operations
+      - BU locks are compatible with other BU locks → parallel streams work
+      - Enables minimal logging on heaps in BULK_LOGGED recovery
+      - Up to 60× reduction in log space, 2×–10× wall-clock speedup
+
+    Usage:
+        with bulk_load_stage_context("UDM_Stage", "UDM_Stage.dbo.MY_TABLE"):
+            bcp_load(...)  # or bcp_load_parallel(...)
+    """
+    conn = connections.get_connection(database)
+    try:
+        cursor = conn.cursor()
+        # 1. Set BULK_LOGGED recovery
+        logger.info("Setting %s to BULK_LOGGED recovery model", database)
+        cursor.execute(f"ALTER DATABASE {quote_identifier(database)} SET RECOVERY BULK_LOGGED")
+        cursor.execute(
+            "SELECT recovery_model_desc FROM sys.databases WHERE name = ?", database,
+        )
+        row = cursor.fetchone()
+        if row and row[0] != "BULK_LOGGED":
+            logger.warning(
+                "ALTER DATABASE SET RECOVERY BULK_LOGGED did not take effect on %s "
+                "(current: %s). BCP loads will be fully logged.",
+                database, row[0] if row else "unknown",
+            )
+
+        # 2. Enable TABLOCK via sp_tableoption — the Linux -h workaround
+        schema_table = ".".join(full_table_name.split(".")[1:])  # schema.table
+        logger.info(
+            "Enabling sp_tableoption 'table lock on bulk load' on %s",
+            full_table_name,
+        )
+        cursor.execute(
+            f"EXEC sp_tableoption '{schema_table}', 'table lock on bulk load', 1"
+        )
+        cursor.close()
+    finally:
+        conn.close()
+
+    try:
+        yield
+    finally:
+        conn = connections.get_connection(database)
+        try:
+            cursor = conn.cursor()
+            # Disable sp_tableoption
+            logger.info(
+                "Disabling sp_tableoption 'table lock on bulk load' on %s",
+                full_table_name,
+            )
+            cursor.execute(
+                f"EXEC sp_tableoption '{schema_table}', 'table lock on bulk load', 0"
+            )
+            # Restore FULL recovery
+            logger.info("Restoring %s to FULL recovery model", database)
+            cursor.execute(f"ALTER DATABASE {quote_identifier(database)} SET RECOVERY FULL")
+            cursor.close()
+            logger.info(
+                "R-3: Restored %s to FULL + disabled TABLOCK on %s",
+                database, full_table_name,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to restore recovery model / sp_tableoption for %s", database
+            )
+        finally:
+            conn.close()
+
+
+# ==========================================================================
+# Bronze LOCK_ESCALATION context
+# ==========================================================================
+
+@contextmanager
+def bulk_load_bronze_context(database: str, full_table_name: str):
+    """Combined context: BULK_LOGGED + LOCK_ESCALATION=DISABLE for Bronze.
+
+    Bronze tables have clustered indexes and concurrent readers. Without
+    TABLOCK, BCP uses row-level locks. Lock escalation at ~5,000 locks
+    takes an exclusive table lock that blocks all readers.
+
+    LOCK_ESCALATION = DISABLE prevents this escalation during the load
+    window. Trade-off: higher lock memory (~128 bytes per lock). Monitor
+    with sys.dm_os_memory_clerks WHERE type = 'OBJECTSTORE_LOCK_MANAGER'.
+
+    Usage:
+        with bulk_load_bronze_context("UDM_Bronze", "UDM_Bronze.dbo.MY_TABLE"):
+            bcp_load(...)
+    """
+    conn = connections.get_connection(database)
+    schema_table_quoted = quote_table(full_table_name)
+    try:
+        cursor = conn.cursor()
+        # 1. Set BULK_LOGGED recovery
+        logger.info("Setting %s to BULK_LOGGED recovery model", database)
+        cursor.execute(f"ALTER DATABASE {quote_identifier(database)} SET RECOVERY BULK_LOGGED")
+        cursor.execute(
+            "SELECT recovery_model_desc FROM sys.databases WHERE name = ?", database,
+        )
+        row = cursor.fetchone()
+        if row and row[0] != "BULK_LOGGED":
+            logger.warning(
+                "ALTER DATABASE SET RECOVERY BULK_LOGGED did not take effect on %s "
+                "(current: %s).", database, row[0] if row else "unknown",
+            )
+
+        # 2. Disable lock escalation to prevent table-level X locks
+        logger.info(
+            "Setting LOCK_ESCALATION = DISABLE on %s during load window",
+            full_table_name,
+        )
+        cursor.execute(f"ALTER TABLE {schema_table_quoted} SET (LOCK_ESCALATION = DISABLE)")
+        cursor.close()
+    finally:
+        conn.close()
+
+    try:
+        yield
+    finally:
+        conn = connections.get_connection(database)
+        try:
+            cursor = conn.cursor()
+            # Restore lock escalation
+            logger.info("Restoring LOCK_ESCALATION = TABLE on %s", full_table_name)
+            cursor.execute(f"ALTER TABLE {schema_table_quoted} SET (LOCK_ESCALATION = TABLE)")
+            # Restore FULL recovery
+            logger.info("Restoring %s to FULL recovery model", database)
+            cursor.execute(f"ALTER DATABASE {quote_identifier(database)} SET RECOVERY FULL")
+            cursor.close()
+            logger.info(
+                "R-3: Restored %s to FULL + LOCK_ESCALATION=TABLE on %s",
+                database, full_table_name,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to restore recovery model / lock_escalation for %s", database
+            )
+        finally:
+            conn.close()
+
+
+# ==========================================================================
+# Parallel BCP streams (Stage heaps only)
+# ==========================================================================
+
+def bcp_load_parallel(
+    csv_path: str,
+    full_table_name: str,
+    expected_row_count: int | None = None,
+    format_file: str | None = None,
+    n_streams: int | None = None,
+) -> int:
+    """Load a BCP CSV file using parallel streams for Stage heaps.
+
+    Splits the CSV into N chunks and runs BCP concurrently via
+    ThreadPoolExecutor. ThreadPoolExecutor is correct (not ProcessPool)
+    because each BCP is an external subprocess — the GIL is irrelevant
+    since Python threads just wait on subprocess I/O.
+
+    PREREQUISITES:
+      - Table must be a heap (no clustered index) — Stage tables.
+      - sp_tableoption 'table lock on bulk load' must be enabled
+        (use bulk_load_stage_context as the outer wrapper).
+      - BU locks are compatible with other BU locks, enabling parallel inserts.
+
+    DO NOT use for Bronze tables — TABLOCK on clustered index tables takes
+    an exclusive lock that blocks parallel imports and all readers.
+
+    Args:
+        csv_path: Path to the CSV file.
+        full_table_name: Fully qualified table name.
+        expected_row_count: If provided, verify total rows across all streams.
+        format_file: Optional BCP format file path.
+        n_streams: Number of parallel streams (default: config.BCP_PARALLEL_STREAMS).
+
+    Returns:
+        Total rows copied across all streams.
+
+    Raises:
+        BCPLoadError: If any stream fails or total row count mismatches.
+    """
+    n_streams = n_streams or config.BCP_PARALLEL_STREAMS
+
+    # Read the CSV and count lines to determine chunk boundaries
+    csv_p = Path(csv_path)
+    total_lines = _count_lines(csv_path)
+
+    if total_lines == 0:
+        logger.info("Parallel BCP: Empty file %s — nothing to load", csv_path)
+        return 0
+
+    # For small files, fall back to single-stream
+    if total_lines < n_streams * 100:
+        logger.info(
+            "Parallel BCP: %d rows too few for %d streams — using single stream",
+            total_lines, n_streams,
+        )
+        return bcp_load(
+            csv_path, full_table_name, expected_row_count,
+            format_file, atomic=False, is_stage=True,
+        )
+
+    # Split the file into chunks
+    chunk_dir = csv_p.parent / f"_chunks_{csv_p.stem}"
+    chunk_dir.mkdir(exist_ok=True)
+    chunk_paths = _split_csv_file(csv_path, n_streams, chunk_dir)
+
+    logger.info(
+        "Parallel BCP: Loading %s -> %s with %d streams (%d rows total, %d chunks)",
+        csv_path, full_table_name, n_streams, total_lines, len(chunk_paths),
+    )
+
+    bcp_env = _build_bcp_env()
+    total_rows = 0
+    errors = []
+
+    def _load_chunk(chunk_path: str) -> tuple[str, int]:
+        """Load a single chunk — runs in thread pool."""
+        cmd = _build_bcp_command(
+            chunk_path, full_table_name, format_file, atomic=False, is_stage=True,
+        )
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=config.BCP_TIMEOUT,
+            env=bcp_env,
+        )
+        if result.returncode != 0:
+            raise BCPLoadError(
+                f"Parallel BCP chunk failed (rc={result.returncode}): "
+                f"{chunk_path}: {result.stderr[:1000]}"
+            )
+        rows = _parse_rows_copied(result.stdout)
+        return chunk_path, rows
+
+    try:
+        with ThreadPoolExecutor(max_workers=n_streams) as executor:
+            futures = {
+                executor.submit(_load_chunk, str(cp)): str(cp)
+                for cp in chunk_paths
+            }
+            for future in as_completed(futures):
+                chunk_file = futures[future]
+                try:
+                    _, rows = future.result()
+                    total_rows += rows
+                    logger.debug(
+                        "Parallel BCP: Chunk %s loaded %d rows", chunk_file, rows
+                    )
+                except Exception as e:
+                    errors.append(f"{chunk_file}: {e}")
+                    logger.error("Parallel BCP: Chunk %s failed: %s", chunk_file, e)
+    finally:
+        # Clean up chunk files
+        shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    if errors:
+        raise BCPLoadError(
+            f"Parallel BCP failed for {full_table_name}: "
+            f"{len(errors)}/{len(chunk_paths)} chunks failed. "
+            f"First error: {errors[0]}"
+        )
+
+    if expected_row_count is not None and total_rows != expected_row_count:
+        raise BCPLoadError(
+            f"Parallel BCP row count mismatch for {full_table_name}: "
+            f"expected={expected_row_count}, got={total_rows}"
+        )
+
+    logger.info(
+        "Parallel BCP: Loaded %d total rows into %s via %d streams",
+        total_rows, full_table_name, len(chunk_paths),
+    )
+    return total_rows
+
+
+def _count_lines(filepath: str) -> int:
+    """Fast line count using wc -l."""
+    try:
+        result = subprocess.run(
+            ["wc", "-l", filepath], capture_output=True, text=True, timeout=60,
+        )
+        return int(result.stdout.strip().split()[0])
+    except Exception:
+        # Fallback: Python line count
+        with open(filepath, "rb") as f:
+            return sum(1 for _ in f)
+
+
+def _split_csv_file(filepath: str, n_chunks: int, output_dir: Path) -> list[Path]:
+    """Split a CSV file into N roughly equal chunks using split command.
+
+    Uses the system `split` command for speed — much faster than Python I/O.
+    """
+    total = _count_lines(filepath)
+    lines_per_chunk = max(1, total // n_chunks + 1)
+
+    prefix = output_dir / "chunk_"
+    subprocess.run(
+        ["split", "-l", str(lines_per_chunk), "-d", "-a", "3", filepath, str(prefix)],
+        check=True, timeout=120,
+    )
+    # Collect the generated chunk files in sorted order
+    chunks = sorted(output_dir.glob("chunk_*"))
+    logger.debug(
+        "Split %s into %d chunks (%d lines/chunk)", filepath, len(chunks), lines_per_chunk
+    )
+    return chunks
+
+
+# ==========================================================================
+# pyodbc fast_executemany for small tables
+# ==========================================================================
+
+def load_small_table_pyodbc(
+    df,
+    full_table_name: str,
+) -> int:
+    """Load a small DataFrame via pyodbc fast_executemany.
+
+    BCP subprocess startup costs ~1–2 seconds (process spawn, TDS handshake,
+    lock acquisition). For tables < 1,000 rows, this overhead exceeds the
+    actual insert time. pyodbc fast_executemany handles this in milliseconds.
+
+    Args:
+        df: Polars DataFrame to load (must be prepared for BCP already).
+        full_table_name: Fully qualified table name (db.schema.table).
+
+    Returns:
+        Number of rows inserted.
+    """
+    if len(df) == 0:
+        return 0
+
+    db = full_table_name.split(".")[0]
+    schema_table = ".".join(full_table_name.split(".")[1:])
+    n_cols = len(df.columns)
+    placeholders = ", ".join(["?"] * n_cols)
+    insert_sql = f"INSERT INTO {quote_table(full_table_name)} VALUES ({placeholders})"
+
+    # Convert Polars DF to list of tuples for pyodbc
+    rows = df.rows()
+
+    conn = connections.get_connection(db)
+    try:
+        cursor = conn.cursor()
+        cursor.fast_executemany = True
+        cursor.executemany(insert_sql, rows)
+        cursor.close()
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info(
+        "pyodbc fast_executemany: Loaded %d rows into %s (bypassed BCP for small table)",
+        len(rows), full_table_name,
+    )
+    return len(rows)
+
+
+# ==========================================================================
+# Smart load router — chooses best strategy by table size and type
+# ==========================================================================
+
+def smart_load(
+    csv_path: str,
+    full_table_name: str,
+    expected_row_count: int | None = None,
+    format_file: str | None = None,
+    atomic: bool = True,
+    *,
+    is_stage: bool = False,
+    df=None,
+) -> int:
+    """Route to the optimal load strategy based on table size and type.
+
+    Decision matrix (from throughput guide benchmarks):
+      - < 1,000 rows AND df provided: pyodbc fast_executemany (skip BCP overhead)
+      - < 1M rows OR Bronze table: single BCP stream (bcp_load)
+      - >= 1M rows AND Stage table: parallel BCP streams (bcp_load_parallel)
+
+    Note: Parallel BCP requires the caller to have set up bulk_load_stage_context
+    (sp_tableoption TABLOCK). This function doesn't manage the context — the
+    caller should wrap the entire load phase in the appropriate context manager.
+
+    Args:
+        csv_path: Path to the CSV file.
+        full_table_name: Fully qualified table name.
+        expected_row_count: Optional row count verification.
+        format_file: Optional BCP format file.
+        atomic: If True, omit -b flag.
+        is_stage: If True, eligible for parallel loading.
+        df: Original Polars DataFrame (required for pyodbc routing).
+
+    Returns:
+        Number of rows loaded.
+    """
+    row_count = expected_row_count
+    if row_count is None and df is not None:
+        row_count = len(df)
+
+    # Route 1: pyodbc fast_executemany for tiny tables
+    if (
+        df is not None
+        and row_count is not None
+        and row_count < config.BCP_SMALL_TABLE_THRESHOLD
+        and row_count > 0
+    ):
+        return load_small_table_pyodbc(df, full_table_name)
+
+    # Route 2: Parallel BCP for large Stage heaps
+    if (
+        is_stage
+        and not atomic
+        and row_count is not None
+        and row_count >= config.BCP_PARALLEL_THRESHOLD
+    ):
+        return bcp_load_parallel(
+            csv_path, full_table_name, expected_row_count, format_file,
+        )
+
+    # Route 3: Single BCP stream (default)
+    return bcp_load(
+        csv_path, full_table_name, expected_row_count, format_file, atomic,
+        is_stage=is_stage,
+    )
+
+
+# ==========================================================================
+# tmpfs helpers
+# ==========================================================================
+
+def get_tmpfs_csv_path(filename: str) -> Path:
+    """Get a CSV path on tmpfs (/dev/shm) if available, else fallback to disk.
+
+    Writing BCP CSVs to tmpfs eliminates source-side disk I/O. Reads/writes
+    occur at memory bandwidth (~10–50 GB/s) vs NVMe SSD (~3–7 GB/s).
+
+    Returns:
+        Path on /dev/shm/udm_bcp/ if tmpfs is enabled and has space,
+        otherwise falls back to config.CSV_OUTPUT_DIR.
+    """
+    if not config.CSV_TMPFS_ENABLED:
+        return Path(config.CSV_OUTPUT_DIR) / filename
+
+    tmpfs_dir = config.CSV_TMPFS_DIR
+    try:
+        tmpfs_dir.mkdir(parents=True, exist_ok=True)
+        # Check available space (need at least 1 GB free)
+        stat = os.statvfs(str(tmpfs_dir))
+        free_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
+        if free_gb < 1.0:
+            logger.debug(
+                "tmpfs has only %.1f GB free — falling back to disk", free_gb
+            )
+            return Path(config.CSV_OUTPUT_DIR) / filename
+        return tmpfs_dir / filename
+    except OSError:
+        logger.debug("tmpfs not available — falling back to disk")
+        return Path(config.CSV_OUTPUT_DIR) / filename
+
+
+def cleanup_tmpfs() -> None:
+    """Remove all files from the tmpfs BCP staging directory."""
+    if config.CSV_TMPFS_ENABLED and config.CSV_TMPFS_DIR.exists():
+        shutil.rmtree(config.CSV_TMPFS_DIR, ignore_errors=True)
+        logger.debug("Cleaned up tmpfs staging dir: %s", config.CSV_TMPFS_DIR)
