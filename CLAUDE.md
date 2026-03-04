@@ -6,54 +6,93 @@ ETL pipeline extracting from Oracle (DNA) and SQL Server (CCM, EPICOR) sources i
 - Python 3.12.11
 - Oracle Instant Client 19c (for oracledb thick mode and ConnectorX oracle:// connections)
 - ODBC Driver 18 for SQL Server (for BCP, pyodbc, and ConnectorX mssql:// connections)
-- Key packages: polars, polars-hash, connectorx, oracledb, pyodbc
+- Key packages: polars>=1.32.0 (streaming anti-joins), polars-hash==0.4.5 (pinned — hash stability), connectorx>=0.3.3, oracledb>=2.0.0, pyodbc>=5.1.0, python-dotenv, psutil
 - BCP utility (mssql-tools18)
 - .env file location: /debi/.env (NOT project root)
 
 ## Structure
-- config.py - env vars, DB names, BCP thresholds, paths (.env at /debi/.env)
-- sources.py - source system registry (Oracle/SQL Server connection factories)
-- connections.py - SQL Server target DB connections (Stage/Bronze/General), cursor_for() context manager
-- cli_common.py - shared CLI boilerplate (environment setup, logging, startup checks, RSS monitoring)
-- main_small_tables.py - CLI entry point for small tables
-- main_large_tables.py - CLI entry point for large tables
-- extract/ — Source Data Extraction
-  - router.py - extraction routing: routes Oracle/SQL Server × ConnectorX/oracledb (E-3)
-  - connectorx_oracle_extractor.py - ConnectorX Oracle extraction -> Polars -> BCP CSV
-  - udm_connectorx_extractor.py - ConnectorX for internal UDM SQL Server reads
-  - oracle_extractor.py - oracledb fallback (date-chunked with INDEX hints)
-  - connectorx_sqlserver_extractor.py - ConnectorX SQL Server extraction -> Polars -> BCP CSV
-- data_load/ — BCP Loading Infrastructure
-  - bcp_loader.py - BCP subprocess wrapper (CSV -> SQL Server)
-  - bcp_csv.py - BCP CSV helpers: hashing (polars-hash), sanitization, column reorder (P0-1), CSV write
-  - row_hash.py - row hashing (polars-hash SHA-256, fallback hashlib)
-  - sanitize.py - DataFrame sanitization (strings, BIT columns, UInt64, Oracle dates)
-  - bcp_format.py - BCP XML format file generation
-  - schema_utils.py - shared schema metadata queries for column validation and PK type lookup (P0-3)
-  - index_management.py - index disable/rebuild around BCP loads
-- cdc/ — Change Data Capture
-  - engine.py - Polars CDC: hash comparison, detect inserts/updates/deletes, NULL PK filter (P0-4)
-  - reconciliation/ - full column-by-column reconciliation subpackage (P3-4)
-- scd2/ — Slowly Changing Dimension Type 2
-  - engine.py - Polars SCD2: Bronze comparison, UPDATES via typed staging (P0-3), INSERTs via BCP
-- orchestration/ — Table Processing Flows
-  - small_tables.py - orchestrator for small tables (no date column)
-  - large_tables.py - orchestrator for large tables (date-chunked, per-day checkpoint)
-  - guards.py - shared extraction guard logic (parameterized thresholds, baseline retrieval)
-  - pipeline_steps.py - shared CDC/SCD2 promotion steps
-  - table_config.py - TableConfig + TableConfigLoader from General.dbo.UdmTablesList
-  - table_lock.py - sp_getapplock table-level locking to prevent concurrent runs (P1-2)
-  - pipeline_state.py - extraction state tracking, gap detection, checkpoints
-- schema/ — DDL & Schema Management
-  - evolution.py - schema drift detection: ADD new cols, WARN removed, ERROR type changes (P0-2)
-  - column_sync.py - auto-populate UdmTablesColumnsList + PK discovery from source
-  - table_creator.py - auto-create Stage/Bronze tables from DataFrame dtypes
-  - staging_cleanup.py - orphaned staging table cleanup at pipeline start (P3-3)
-- migrations/ — One-time schema migration scripts
-  - b1_hash_varchar64.py - ALTER _row_hash/UdmHash from BIGINT to VARCHAR(64)
-- observability/ — Logging & Metrics
-  - event_tracker.py - PipelineEventTracker context manager -> General.ops.PipelineEventLog
-  - log_handler.py - SqlServerLogHandler (logging.Handler) -> General.ops.PipelineLog
+
+> Restructured 2026-02-23 (5 phases). The `pipeline/` directory no longer exists. Post-restructure hardening (25 items) completed 2026-02-24. See `project_restructure.md` for full details.
+
+```
+python_udm/
+├── main_small_tables.py              # CLI entry point — small tables
+├── main_large_tables.py              # CLI entry point — large tables
+├── config.py                         # env vars, BCP thresholds, CSV contract, paths (.env at /debi/.env)
+├── connections.py                    # SQL Server target connections, cursor_for() with connection pool (Item-18), H-1 quoting, resolve_schema_name()
+├── sources.py                        # source system registry (Oracle/SQL Server), register_source()
+├── cli_common.py                     # shared CLI boilerplate (MALLOC_ARENA_MAX, POLARS_MAX_THREADS, logging, startup checks, RSS monitoring, shutdown_connections)
+├── requirements.txt
+│
+├── extract/                          # ── Source Data Extraction ──
+│   ├── __init__.py                   #   cx_read_sql_safe() — Rust panic recovery + retry (B-7)
+│   ├── router.py                     #   extraction routing: Oracle/SQL Server × ConnectorX/oracledb (E-3)
+│   ├── connectorx_oracle_extractor.py#   ConnectorX Oracle extraction → Polars → BCP CSV
+│   ├── connectorx_sqlserver_extractor.py # ConnectorX SQL Server extraction → Polars → BCP CSV
+│   ├── oracle_extractor.py           #   oracledb fallback (date-chunked with INDEX hints)
+│   └── udm_connectorx_extractor.py   #   ConnectorX for internal UDM SQL Server reads
+│
+├── data_load/                        # ── BCP Loading Infrastructure ──
+│   ├── bcp_csv.py                    #   prepare_dataframe_for_bcp(), write_bcp_csv(), schema validation
+│   ├── row_hash.py                   #   polars-hash SHA-256 hashing + single-pass normalization (E-1, E-4, W-2, W-3)
+│   ├── sanitize.py                   #   string sanitization, BIT cast, UInt64, Oracle dates (Item-20), column reorder
+│   ├── bcp_format.py                 #   BCP XML format file generation (W-13)
+│   ├── bcp_loader.py                 #   BCP subprocess wrapper: single/parallel streams, hang monitor, smart routing, tmpfs, pyodbc fast_executemany
+│   ├── schema_utils.py               #   INFORMATION_SCHEMA queries, PK type lookup, dtype alignment, column metadata cache
+│   └── index_management.py           #   index disable/rebuild around BCP loads
+│
+├── cdc/                              # ── Change Data Capture ──
+│   ├── engine.py                     #   CDCContext + _run_cdc_core unified engine (run_cdc, run_cdc_windowed)
+│   └── reconciliation/               #   full reconciliation subpackage (9 modules)
+│       ├── __init__.py               #     re-exports all 15 public names
+│       ├── models.py                 #     10 result dataclasses
+│       ├── persistence.py            #     ReconciliationLog table + writer (OBS-6)
+│       ├── core.py                   #     reconcile_table, reconcile_table_windowed (C-7 size guard)
+│       ├── counts.py                 #     reconcile_counts (W-11), reconcile_active_pks (E-7)
+│       ├── scd2_integrity.py         #     reconcile_bronze (P2-13), validate_scd2_integrity (V-3), H-1 quoting
+│       ├── data_quality.py           #     reconcile_aggregates (E-17), detect_distribution_shift (B-10)
+│       ├── boundaries.py             #     reconcile_transformation_boundary (B-11), check_referential_integrity (B-12)
+│       └── velocity.py               #     check_version_velocity (E-13)
+│
+├── scd2/                             # ── Slowly Changing Dimension Type 2 ──
+│   └── engine.py                     #   run_scd2, run_scd2_targeted, 3-step INSERT-first pattern
+│
+├── orchestration/                    # ── Table Processing Flows ──
+│   ├── small_tables.py               #   full pipeline for small tables (276 lines)
+│   ├── large_tables.py               #   date-chunked pipeline, per-day checkpoints (487 lines)
+│   ├── pipeline_steps.py             #   shared CDC/SCD2 promotion steps (D-1 through D-3), CSV cleanup, active ratio logging, freshness checks
+│   ├── guards.py                     #   parameterized extraction guard + day-of-week aware baselines TOP 14 (G-1/G-2)
+│   ├── table_config.py               #   TableConfig + TableConfigLoader from UdmTablesList, ColumnConfig
+│   ├── table_lock.py                 #   sp_getapplock Session-owned locking + heartbeat
+│   └── pipeline_state.py             #   checkpoint MERGE, gap detection, dates_to_process
+│
+├── schema/                           # ── DDL & Schema Management ──
+│   ├── evolution.py                  #   schema drift: ADD new cols, WARN removed, ERROR type changes, quarantine (W-17)
+│   ├── column_sync.py                #   auto-populate UdmTablesColumnsList + PK discovery, source type drift detection (E-16)
+│   ├── table_creator.py              #   auto-create Stage/Bronze tables + 3 index types (SCD-1, V-9, W-10)
+│   └── staging_cleanup.py            #   orphaned _staging_* table cleanup (P3-3)
+│
+├── observability/                    # ── Logging & Metrics ──
+│   ├── event_tracker.py              #   PipelineEventTracker → General.ops.PipelineEventLog
+│   └── log_handler.py                #   SqlServerLogHandler → General.ops.PipelineLog
+│
+├── migrations/                       # ── One-time Schema Migrations ──
+│   └── b1_hash_varchar64.py          #   ALTER _row_hash/UdmHash from BIGINT to VARCHAR(64)
+│
+└── tests/                            # ── Test Infrastructure ──
+    └── test_hash_regression.py       #   polars-hash upgrade regression harness (Item-7)
+```
+
+**Dependency flow** (strictly top-down, no circular dependencies):
+```
+main_*.py → cli_common → orchestration/{small,large}_tables
+  → extract/router.py → extract/*
+  → orchestration/pipeline_steps → cdc/engine → scd2/engine
+  → data_load/* (BCP CSV + load)
+  → schema/* (ensure tables, evolve schema)
+  → observability/* (log everything)
+Config, connections, sources, and observability are shared horizontally.
+```
 
 ## Known Issues & Backlog
 See **TODO.md** for the remaining edge cases and hardening work. All 14 edge cases from the *Validating 14 Edge Cases in a Polars-BCP-CDC-SCD2 Pipeline on RHEL* research have been audited — 12 are fully implemented, 2 have remaining work:
@@ -84,6 +123,45 @@ String sanitization: replace \t \n \r \x00 with empty string BEFORE write_csv
 Batch size:         write_csv(batch_size=4096) to avoid memory spikes
 ```
 
+## BCP Loading Strategy
+
+The pipeline uses `smart_load()` in `bcp_loader.py` to route to the optimal load strategy based on table size and type:
+
+| Condition | Strategy | Why |
+|-----------|----------|-----|
+| < 1,000 rows AND DataFrame provided | `load_small_table_pyodbc()` (fast_executemany) | BCP subprocess startup costs ~1–2s; pyodbc completes in milliseconds |
+| < 1M rows OR Bronze table | `bcp_load()` (single BCP stream) | Default path; Bronze tables must not use parallel TABLOCK |
+| >= 1M rows AND Stage table | `bcp_load_parallel()` (parallel streams) | 8 concurrent streams with BU lock compatibility for Stage heaps |
+
+**Stage tables (heaps):** Use `bulk_load_stage_context()` which sets BULK_LOGGED recovery + `sp_tableoption 'table lock on bulk load'`. BU locks are compatible → parallel BCP streams work. Up to 60× log reduction, 2×–10× wall-clock speedup.
+
+**Bronze tables (clustered index):** Use `bulk_load_bronze_context()` which sets BULK_LOGGED recovery + `LOCK_ESCALATION = DISABLE`. No TABLOCK (would take exclusive lock blocking readers). FastLoadContext provides minimal logging for newly allocated pages. Lock escalation disabled to prevent table-level X locks during BCP inserts.
+
+**tmpfs CSV staging:** CSVs are written to `/dev/shm/udm_bcp/` (tmpfs) when enabled, eliminating disk I/O. Reads/writes at memory bandwidth (~10–50 GB/s) vs NVMe (~3–7 GB/s). Falls back to `CSV_OUTPUT_DIR` if tmpfs is unavailable or < 1GB free.
+
+**BCP Packet Size:** TDS packet size set to 32,768 bytes (32 KB, matching SQL Server extent size) via `-a` flag. Default 4096 is dramatically undersized for bulk ops; 32KB benchmarks show 10–20% throughput gain.
+
+## BCP Hang Monitor (BCP-HANG-FIX-v2)
+
+A background monitor thread (`_BCPHangMonitor`) runs while BCP is executing, querying SQL Server DMVs every `BCP_MONITOR_INTERVAL` seconds (default 15s) to produce real-time diagnostic snapshots covering all hang causes:
+
+| § | Cause | What the monitor checks |
+|---|-------|------------------------|
+| §1 | Lock conflicts | BCP session wait_type, blocking_session_id, wait_time |
+| §2 | Schema mod blocks | Sch-M blocking chains (DDL/index rebuilds) |
+| §3 | Lock escalation | Whether table-level X lock has been acquired |
+| §4 | Log pressure | Transaction log used %, log_reuse_wait, VLF count |
+| §5 | Index overhead | Row count progress tracking (stalled = index I/O) |
+| §6 | Network/TLS hang | BCP session not visible (never connected) |
+| §7 | Orphaned sessions | Other BULK INSERT sessions on same table |
+| §8 | I/O bottleneck | PAGEIOLATCH_EX waits, avg write latency per file |
+
+**Early abort:** When a definitive hang signature persists beyond `BCP_HANG_ABORT_THRESHOLD` seconds (default 120s), the monitor signals the main thread to SIGTERM the BCP process immediately rather than waiting the full `BCP_TIMEOUT` (7200s). The abort includes a specific diagnosis identifying the root cause.
+
+**Orphan cleanup:** `_cleanup_orphaned_bcp_sessions()` detects and kills other BULK INSERT sessions targeting the same table before BCP starts (§7). After killing, waits `BCP_ORPHAN_ROLLBACK_WAIT` seconds (default 15s) for SQL Server to complete rollback.
+
+The monitor uses its OWN pyodbc connection (bypasses the connection pool per Item-23 thread-safety constraint). If the monitor connection fails, BCP continues — monitoring is best-effort.
+
 ## Table Naming Conventions
 Naming is driven by UdmTablesList. Custom names override the default when StageTableName or BronzeTableName is populated.
 
@@ -99,6 +177,7 @@ Pattern: `{target_db}.{SourceName}.{table_name}_{suffix}`
 - Stage suffix: `_cdc`
 - Bronze suffix: `_scd2_python`
 - The schema in UDM_Stage and UDM_Bronze is the SourceName (e.g., DNA, CCM, EPICOR), NOT the source schema
+- `resolve_schema_name()` in connections.py resolves actual schema casing from `sys.schemas` to prevent BCP hangs on case-mismatched schemas
 
 ## Data Flow (per table)
 
@@ -106,7 +185,7 @@ Pattern: `{target_db}.{SourceName}.{table_name}_{suffix}`
 Source (Oracle/SQL Server)
   -> ConnectorX full extract -> Polars DataFrame
   -> add _row_hash (polars-hash, deterministic across sessions) + _extracted_at
-  -> Write BCP CSV (per BCP CSV Contract above)
+  -> Write BCP CSV (per BCP CSV Contract above) — tmpfs or disk
   -> Ensure stage/bronze tables exist in UDM (auto-create from DataFrame dtypes)
   -> Schema evolution: detect new/removed/changed columns (P0-2)
   -> Column sync: auto-populate UdmTablesColumnsList + discover PKs from source
@@ -130,7 +209,7 @@ Per-day processing pipeline: extract one day at a time → windowed CDC → targ
 Source (Oracle/SQL Server)
   -> Windowed extract (single day via SourceAggregateColumnName) -> Polars DataFrame
   -> add _row_hash (polars-hash) + _extracted_at
-  -> Write BCP CSV (per BCP CSV Contract above)
+  -> Write BCP CSV (per BCP CSV Contract above) — tmpfs or disk
   -> Ensure stage/bronze tables exist (first day only)
   -> Schema evolution (P0-2)
   -> Column sync (first load only)
@@ -165,7 +244,7 @@ Source (Oracle/SQL Server)
 
 ## Key Architecture Decisions
 
-**Extraction routing** is driven by UdmTablesList columns:
+**Extraction routing** is centralized in `extract/router.py` and driven by UdmTablesList columns:
 - SourceIndexHint: populated -> oracle_extractor (date-chunked INDEX hint)
 - SourceIndexHint: NULL + Oracle -> connectorx_extractor (bulk FULL scan, 10-20x faster)
 - PartitionOn: If value is not null then use column as ConnectorX partition_on column value else use regular ConnectorX extract. If both SourceIndexHint and PartitionOn are not NULL then proceed with using SourceIndexHint and oracledb for Oracle extracts otherwise proceed with ConnectorX for non-Oracle extracts.
@@ -188,7 +267,10 @@ Source (Oracle/SQL Server)
 - Oracle (oracledb): thick mode via Oracle Instant Client 19c
 - SQL Server (ConnectorX): `mssql://user:pass@host:port/database`
 - SQL Server (pyodbc/BCP): ODBC Driver 18 for SQL Server
-- Further details TBD after connection testing
+
+**Connection pooling (Item-18):** `cursor_for()` in connections.py maintains a per-database connection pool (one long-lived connection per database). Eliminates TCP/TLS/ODBC handshake overhead for repeated calls. `OperationalError` evicts stale connections automatically. `close_connection_pool()` at shutdown via `cli_common.shutdown_connections()`. Lock-holding connections (table_lock.py) bypass the pool entirely.
+
+**SQL identifier quoting (H-1):** `quote_identifier()` and `quote_table()` in connections.py bracket-escape identifiers with `]]` doubling, equivalent to T-SQL `QUOTENAME()`. Rejects identifiers >128 characters. All dynamic SQL in the pipeline uses these helpers — never raw f-strings with user-supplied names.
 
 **Column Tracking** via General.dbo.UdmTablesColumnsList — used AFTER UDM tables have been created:
 - SourceName: The source name of where data originates.
@@ -235,7 +317,7 @@ Optimistic behavior:
 
 **SCD2 is optimized from 5 steps to 2**: (1) single UPDATE batch for closes/deletes, (2) single INSERT batch for new rows + new versions. Unchanged rows are counted but NOT touched — saves GB of transaction log.
 
-**BULK_LOGGED recovery model** is set on the target DB during the load window, restored to FULL with a log backup after. This is wrapped via '_bulk_load_recovery_context()'.
+**BULK_LOGGED recovery model** is managed by context managers: `bulk_load_stage_context()` for Stage heaps (TABLOCK via sp_tableoption) and `bulk_load_bronze_context()` for Bronze (LOCK_ESCALATION=DISABLE). Both restore FULL recovery on exit.
 
 ## Observability: Event Tracking + Pipeline Logs
 
@@ -342,9 +424,92 @@ Questions these tables answer together:
 - "Did any step fail and need a retry?" — PipelineEventLog where Status = FAILED, then PipelineLog for StackTrace.
 - "Are we seeing data quality drift?" — PipelineEventLog, trend RowsProcessed and RowsInserted/Updated/Deleted over time per table.
 
+## Configuration Variables
+
+### BCP Throughput Configuration (config.py)
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `BCP_STAGE_BATCH_SIZE` | 100,000 | BCP `-b` batch size for Stage heaps (fewer large batches = fewer log flushes) |
+| `BCP_BRONZE_BATCH_SIZE` | 800 | BCP `-b` batch size for Bronze (stay below lock escalation threshold) |
+| `BCP_BATCH_SIZE` | 5,000 | Legacy fallback when caller doesn't specify stage vs bronze |
+| `BCP_PACKET_SIZE` | 32,768 | TDS packet size `-a` flag (32 KB matches SQL Server extent write size) |
+| `BCP_PARALLEL_STREAMS` | 8 | Number of parallel BCP streams for Stage heap loads |
+| `BCP_PARALLEL_THRESHOLD` | 1,000,000 | Minimum rows to trigger parallel BCP (below = single stream) |
+| `BCP_SMALL_TABLE_THRESHOLD` | 1,000 | Below this, use pyodbc fast_executemany instead of BCP |
+| `CSV_TMPFS_DIR` | /dev/shm/udm_bcp | tmpfs directory for BCP CSV staging |
+| `CSV_TMPFS_ENABLED` | true | Enable tmpfs CSV staging |
+| `BCP_TIMEOUT` | 7,200 | BCP subprocess timeout in seconds |
+| `BCP_MAX_RETRIES` | 3 | Retry count for blocked BCP loads |
+| `BCP_ORPHAN_ROLLBACK_WAIT` | 15 | Seconds to wait after killing orphaned BULK INSERT sessions |
+| `BCP_MONITOR_INTERVAL` | 15 | Seconds between monitor DMV queries during BCP execution |
+| `BCP_HANG_ABORT_THRESHOLD` | 120 | Seconds before hang monitor triggers early abort |
+
+### Pipeline Configuration
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SCD2_UPDATE_BATCH_SIZE` | 4,000 | Stay below 5,000 to prevent lock escalation (B-2) |
+| `MAX_RSS_GB` | 48.0 | RSS memory ceiling; WARNING at 85%, ERROR at limit (B-8) |
+| `OVERLAP_MINUTES` | 0 | Large table cross-midnight transaction overlap (V-7) |
+
 ## Deployment Requirements
-- **MALLOC_ARENA_MAX=2** must be set in the systemd unit file, shell wrapper, or `.bashrc` for the pipeline user BEFORE the Python process starts (W-4). `os.environ.setdefault()` in main_*.py only covers child processes — glibc arena configuration is locked at process start. Without this, Polars/Rust allocations can cause 10x memory bloat from glibc arena fragmentation (Polars issue #23128).
+- **MALLOC_ARENA_MAX=2** must be set in the systemd unit file, shell wrapper, or `.bashrc` for the pipeline user BEFORE the Python process starts (W-4). `cli_common.py` sets `os.environ.setdefault()` which only covers child processes — glibc arena configuration is locked at process start. Without this, Polars/Rust allocations can cause 10x memory bloat from glibc arena fragmentation (Polars issue #23128).
+- **POLARS_MAX_THREADS=1** set by `cli_common.py` prevents thread oversubscription when using ProcessPoolExecutor — parallelism is achieved via multiprocessing.
 - **mssql-tools18**: Current minimum version is the installed default. When v18.6.1.1+ is available, upgrade to re-enable `-C 65001` for explicit UTF-8 codepage control (W-1).
+
+## Import Reference
+
+Current import paths (the `pipeline.*` namespace no longer exists):
+
+```python
+# CDC
+from cdc.engine import run_cdc, run_cdc_windowed, CDCResult, purge_expired_cdc_rows
+from cdc.reconciliation import reconcile_table, reconcile_counts, validate_scd2_integrity, ...
+
+# SCD2
+from scd2.engine import run_scd2, run_scd2_targeted, SCD2Result
+
+# Orchestration
+from orchestration.small_tables import process_small_table
+from orchestration.large_tables import process_large_table
+from orchestration.pipeline_steps import run_cdc_promotion, run_scd2_promotion, cleanup_csvs
+from orchestration.guards import check_extraction_guard, run_extraction_guard
+from orchestration.table_config import TableConfig, TableConfigLoader, ColumnConfig
+from orchestration.table_lock import acquire_table_lock, release_table_lock, keep_lock_alive
+from orchestration.pipeline_state import save_checkpoint, get_dates_to_process, detect_gaps
+
+# Extraction
+from extract.router import extract_full, extract_windowed
+from extract import cx_read_sql_safe
+from extract.udm_connectorx_extractor import read_stage_table, read_bronze_table, table_exists
+
+# Data Load
+from data_load.bcp_csv import prepare_dataframe_for_bcp, write_bcp_csv, validate_schema_before_concat
+from data_load.row_hash import add_row_hash, add_row_hash_fallback
+from data_load.sanitize import sanitize_strings, reorder_columns_for_bcp, cast_bit_columns
+from data_load.bcp_loader import bcp_load, bcp_load_parallel, smart_load, load_small_table_pyodbc
+from data_load.bcp_loader import truncate_table, bulk_load_recovery_context, create_staging_index
+from data_load.bcp_loader import bulk_load_stage_context, bulk_load_bronze_context
+from data_load.bcp_loader import get_tmpfs_csv_path, cleanup_tmpfs, BCPLoadError, BCPBlockedError
+from data_load.bcp_format import generate_bcp_format_file
+from data_load.schema_utils import get_column_metadata, get_column_types, align_pk_dtypes, clear_column_metadata_cache
+
+# Schema
+from schema.evolution import evolve_schema, validate_source_schema, SchemaEvolutionResult
+from schema.column_sync import sync_columns, detect_source_type_drift
+from schema.table_creator import ensure_stage_table, ensure_bronze_table
+from schema.staging_cleanup import cleanup_orphaned_staging_tables
+
+# Observability
+from observability.event_tracker import PipelineEventTracker
+from observability.log_handler import SqlServerLogHandler
+
+# Shared root modules
+from cli_common import setup_logging, startup_checks, shutdown_connections, check_rss_memory, table_config_to_dict
+from connections import cursor_for, close_connection_pool, get_connection, verify_rcsi_enabled
+from connections import quote_identifier, quote_table, resolve_schema_name
+from sources import get_source, register_source, SourceType
+import config
+```
 
 ## Gotchas
 - Item-22: `CSV_OUTPUT_DIR` is safe for concurrent `--workers` only because each table's extract→CDC→SCD2→cleanup pipeline is sequential within a single worker. `cleanup_csvs()` globs `{source}_{table}_*.csv` with a trailing underscore (P3-6) to prevent cross-table matches. Do NOT restructure the pipeline to allow overlapping steps within a worker without adding per-table subdirectories for CSV isolation.
@@ -419,6 +584,31 @@ Questions these tables answer together:
 - B-13: Six Oracle→SQL Server type conversion pitfalls: (1) Oracle DATE includes time — `fix_oracle_date_columns()` upcasts `pl.Date` to `pl.Datetime` to prevent truncation. (2) Oracle NUMBER without precision can have >8 decimal places — document and monitor. (3) Oracle FLOAT(126) loses precision vs SQL Server FLOAT(53) — ~15 significant digits max. (4) Oracle RAW(16) GUID uses big-endian vs SQL Server mixed-endian — requires byte reordering if used as join keys. (5) Oracle BLOB/CLOB 4GB vs SQL Server 2GB limit — silent truncation possible. (6) Oracle VARCHAR2 BYTE vs SQL Server VARCHAR character semantics differ for multi-byte.
 - B-14: The INSERT-first SCD2 pattern creates a transient zero-active-row window between closing old versions and activating new versions. Under RCSI, new readers during this window see zero active rows for affected PKs. Documented in `scd2/engine.py` module docstring. Defensive query pattern: `ROW_NUMBER() OVER (PARTITION BY pk_cols ORDER BY UdmEffectiveDateTime DESC) WHERE rn = 1`.
 
+## Post-Restructure Hardening (25 Items — Completed 2026-02-24)
+
+See `project_restructure.md` for full details. Key highlights:
+
+**P0 — Critical Security:**
+- Item 13: SQL injection fix in `cdc/reconciliation/scd2_integrity.py` — replaced all `f"[{c}]"` with `quote_identifier(c)` and raw table names with `quote_table()` (H-1 discipline)
+- Item 14: SQL injection fix in `orchestration/large_tables.py` — `_check_null_date_column()` uses `quote_identifier()` for SQL Server, double-quote escaping for Oracle
+
+**P1 — Security & Correctness:**
+- Item 11: BCP subprocess uses minimal env (`PATH`, `HOME`, `LANG`, `SQLCMDPASSWORD`) instead of `{**os.environ}` to prevent secret leakage
+- Items 15–16: Migrated manual `conn/try/finally` patterns to `cursor_for()` in CDC engine and reconciliation
+- Item 17: `bulk_load_recovery_context()` verifies ALTER DATABASE took effect via `sys.databases` query
+
+**P2 — Performance & Infrastructure:**
+- Item 8: Single-pass normalization in `row_hash.py` — combined three `with_columns` passes (Oracle empty→NULL, NFC, RTRIM) into one
+- Item 12: Extraction guard baselines use TOP 14 (was TOP 5) for day-of-week aware rolling median over 2 full weeks
+- Item 18: Per-database connection pool in `cursor_for()` with `OperationalError` eviction; `close_connection_pool()` at shutdown
+
+**P3 — Correctness & Robustness:**
+- Item 7: Hash regression test harness (`tests/test_hash_regression.py`) for polars-hash upgrades
+- Item 10: `_looks_like_datetime_column()` improved — sample size 20, threshold 90%, 6 datetime formats
+- Item 19: `gc.collect()` after `del df` at extraction→SCD2 transition in large tables
+- Item 20: `fix_oracle_date_columns(stage_table=...)` checks INFORMATION_SCHEMA before content-based datetime detection
+- Item 21: Fixed dead comparison in `reorder_columns_for_bcp()`
+
 ## Do NOT
 - Do NOT truncate Bronze tables — SCD2 is append-only by design
 - Do NOT use write_csv without batch_size=4096 on large DataFrames
@@ -444,11 +634,14 @@ Questions these tables answer together:
 - Do NOT change `@LockOwner` in table_lock.py from 'Session' to 'Transaction' without removing the explicit `sp_releaseapplock` call — Transaction-scoped locks with explicit release before COMMIT create a race condition under RCSI (W-8)
 - Do NOT use `bcp_load(atomic=False)` for Bronze SCD2 loads — partial loads break SCD2 atomicity. Only Stage and ephemeral staging table loads should use `atomic=False` (E-3)
 - Do NOT set `UdmActiveFlag=1` directly in `_build_scd2_insert()` for operation='U' — new versions must be inserted with UdmActiveFlag=0 and activated via `_activate_new_versions()` after closing old versions. Otherwise the filtered unique index rejects the INSERT (E-2)
+- Do NOT use `bcp_load_parallel()` for Bronze tables — TABLOCK on clustered index tables takes an exclusive lock that blocks parallel imports and all readers. Only use for Stage heaps with sp_tableoption enabled.
+- Do NOT access `_connection_pool` from multiple threads — the pool is per-process and NOT thread-safe (Item-23). The BCP hang monitor uses its own dedicated connection for this reason.
+- Do NOT upgrade polars or polars-hash without running `tests/test_hash_regression.py` first — a version change that alters string rendering silently changes every hash, triggering a mass-update cascade (H-2, Item-7)
 - (Additional rules to be added as we test and discover anti-patterns)
 
 ## Autonomous Rules
 - Proceed without asking: refactoring shared utilities, adding type hints, fixing lint
-- STOP and ask: changing BCP CSV format, modifying CDC/SCD2 comparison logic, altering table naming conventions, changing database/schema names, changing hash algorithm or polars-hash configuration, weakening or removing any edge case safeguard (P0-1 through P3-4)
+- STOP and ask: changing BCP CSV format, modifying CDC/SCD2 comparison logic, altering table naming conventions, changing database/schema names, changing hash algorithm or polars-hash configuration, weakening or removing any edge case safeguard (P0-1 through P3-4), changing BCP loading strategy (smart_load routing, parallel BCP thresholds)
 - If a module fails to import: check sys.path.insert — project uses parent-directory imports
 - Always verify BCP CSV format compatibility after ANY change to write functions
 - Test with --table <single_table> --source DNA before running full pipeline
@@ -456,6 +649,8 @@ Questions these tables answer together:
 ## Error Recovery
 - BCP row count mismatch -> investigate string sanitization, check for new control characters in source data
 - BCP column count mismatch -> source schema changed (new/dropped column). `schema/evolution.py` handles new columns automatically; removed columns log WARNING. Check PipelineLog for SchemaEvolutionError if a type changed.
+- BCP hang (timeout with no progress) -> check BCP hang monitor diagnostics in PipelineLog. Common causes: orphaned BULK INSERT sessions (§7), lock conflicts (§1), schema modification blocks (§2), transaction log full (§4). The hang monitor provides specific diagnosis and early abort.
+- BCP blocked error (BCPBlockedError) -> orphaned sessions from a previous crashed BCP run are holding locks. `_cleanup_orphaned_bcp_sessions()` handles this automatically on retry. Check `BCP_MAX_RETRIES` and `BCP_ORPHAN_ROLLBACK_WAIT` configuration.
 - ConnectorX connection failure -> verify .env credentials, check Oracle listener, try oracledb fallback
 - CDC table auto-create failure -> check schema exists, verify _polars_dtype_to_sql mapping covers the dtype
 - SCD2 staging table cleanup -> _execute_bronze_updates drops staging table in finally block; run `schema/staging_cleanup.py` to clean orphans from crashes
@@ -467,3 +662,6 @@ Questions these tables answer together:
 - Large table OOM -> extraction window too wide for available memory. Reduce LookbackDays or verify the per-day processing path is being used (orchestration/large_tables.py processes one day at a time)
 - Schema evolution error skipping table -> a source column changed type. Requires manual resolution: verify the type change is intentional, ALTER the target column or re-create the table, then re-run with `--force`
 - Table lock not acquired -> another pipeline run is processing the same table. Wait for it to complete, or check for stale sessions if the other run crashed (Session-owned sp_getapplock locks auto-release on disconnect)
+- BCP hangs on schema casing mismatch -> `resolve_schema_name()` in connections.py resolves actual schema casing from `sys.schemas`. If BCP hangs on a new table, verify the schema name casing matches what SQL Server stores.
+- Parallel BCP chunk failure -> check which chunk failed in PipelineLog. The chunk files are in `_chunks_{stem}/` under the CSV directory. A single chunk failure fails the entire parallel load.
+- pyodbc fast_executemany failure on small table -> falls back to single BCP stream. Check if the table has > `BCP_SMALL_TABLE_THRESHOLD` (1000) rows or if the DataFrame was not provided to `smart_load()`.
