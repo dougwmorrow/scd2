@@ -1,0 +1,18 @@
+# N-3: Minimum version for native str.normalize("NFC") support (PR #20483).
+# P-6: Native streaming engine anti-joins require v1.32+ (PR #21937).
+# Deploying with <1.32 silently falls back to the in-memory engine.
+polars>=1.32.0
+# H-2: Pin polars-hash to exact version. polars-hash hashes the string
+# representation of values. A Polars or polars-hash version upgrade that
+# changes how values render as strings will silently change hashes, causing
+# every row to appear "changed" — a mass-update cascade. Run hash regression
+# tests before upgrading either package.
+polars-hash==0.4.5
+connectorx>=0.3.3
+oracledb>=2.0.0
+pyodbc>=5.1.0
+python-dotenv>=1.0.0
+psutil>=5.9.0
+# File extraction: calamine Python binding for Polars Excel reading (.xlsx + .xls).
+# Rust-native engine — faster than openpyxl, handles both .xlsx and .xls formats.
+fastexcel>=0.9.0

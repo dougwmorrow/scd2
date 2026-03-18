@@ -2,6 +2,8 @@
 
 Two new pipelines extend the existing Oracle/SQL Server ETL to consume file-based sources and scan network drives for metadata. Both pipelines feed into the same medallion architecture (UDM_Stage CDC → UDM_Bronze SCD2) and reuse all existing infrastructure — CDC engine, SCD2 engine, BCP loading, event tracking, schema evolution, and column sync.
 
+> **Note:** The Network Drive Scanner has been split into its own self-contained directory at `drive_scanner/` in preparation for a separate GitHub repository. It contains its own copy of all shared pipeline infrastructure. The File Extract pipeline remains in the main project.
+
 ---
 
 ## Table of Contents
