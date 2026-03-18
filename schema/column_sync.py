@@ -26,19 +26,26 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def sync_columns(table_config: TableConfig, refresh_pks: bool = False) -> bool:
+def sync_columns(
+    table_config: TableConfig,
+    refresh_pks: bool = False,
+    file_pk_columns: list[str] | None = None,
+) -> bool:
     """Sync column metadata into UdmTablesColumnsList for a new table.
 
     1. Check if rows already exist — skip if so (idempotent).
     2. Read INFORMATION_SCHEMA.COLUMNS from the Stage and Bronze tables.
     3. Insert rows into UdmTablesColumnsList for both layers.
-    4. Discover PKs from the source system.
+    4. Discover PKs from the source system (or use file_pk_columns if provided).
     5. UPDATE IsPrimaryKey for discovered PKs.
     6. Reload columns into table_config so CDC/SCD2 work on the first run.
 
     Args:
         table_config: Table configuration (tables must already exist in UDM).
         refresh_pks: P1-10 — If True, re-discover PKs even if columns already exist.
+        file_pk_columns: Explicit PK column names for file-based sources.
+            When provided, skips _discover_pks() (files have no source database
+            to query) and uses these columns directly.
 
     Returns:
         True if columns were synced (new table), False if already populated.
@@ -80,13 +87,21 @@ def sync_columns(table_config: TableConfig, refresh_pks: bool = False) -> bool:
         stage_count, bronze_count, source_name, table_name,
     )
 
-    # Step 2: Discover PKs from source system
-    pk_columns = _discover_pks(table_config)
+    # Step 2: Discover PKs — use explicit file PKs or discover from source
+    if file_pk_columns:
+        # File-based sources: PKs are declared in FileExtract.PrimaryKeyColumns
+        pk_columns = file_pk_columns
+        logger.info(
+            "Using explicit file PK columns for %s.%s: %s",
+            source_name, table_name, pk_columns,
+        )
+    else:
+        pk_columns = _discover_pks(table_config)
 
     if pk_columns:
         _update_pk_flags(source_name, table_name, pk_columns)
         logger.info(
-            "Discovered and set PKs for %s.%s: %s",
+            "Set PKs for %s.%s: %s",
             source_name, table_name, pk_columns,
         )
     else:

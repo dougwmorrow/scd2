@@ -152,6 +152,11 @@ SCD2_UPDATE_BATCH_SIZE = int(os.getenv("SCD2_UPDATE_BATCH_SIZE", "4000"))
 # Combine with MALLOC_ARENA_MAX=2 (W-4) for best results.
 MAX_RSS_GB = float(os.getenv("MAX_RSS_GB", "48.0"))
 
+# --- Drive Scanner Configuration ---
+# Batch size for accumulating file metadata dicts before converting to a Polars
+# DataFrame chunk. 50K rows = ~5 MB memory per batch. Progress logs every batch.
+DRIVE_SCANNER_BATCH_SIZE = int(os.getenv("DRIVE_SCANNER_BATCH_SIZE", "50000"))
+
 EPICOR_SERVER_HOST = os.getenv("EPICOR_SERVER_HOST", SQL_SERVER_HOST)
 EPICOR_SERVER_PORT = int(os.getenv("EPICOR_SERVER_PORT", str(SQL_SERVER_PORT)))
 EPICOR_SERVER_USER = os.getenv("EPICOR_SERVER_USER", SQL_SERVER_USER)

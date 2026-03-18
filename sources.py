@@ -10,6 +10,7 @@ import config
 class SourceType(Enum):
     ORACLE = "ORACLE"
     SQL_SERVER = "SQL_SERVER"
+    FILE = "FILE"
 
 
 @dataclass(frozen=True)
